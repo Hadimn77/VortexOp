@@ -1,0 +1,22 @@
+# Core numerical and scientific libraries
+numpy
+scipy
+numba
+
+# GUI and Visualization
+PyQt5
+pyvista>=0.38.0
+pyvistaqt
+
+# Geometry, CAD Import, and Meshing
+trimesh[easy]
+ocp
+gmsh
+pymeshfix
+
+# Optimization and Plotting
+scikit-optimize
+matplotlib
+
+# Utilities
+packaging
