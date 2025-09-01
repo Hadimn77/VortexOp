@@ -12,7 +12,7 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
 - **FEA Simulation:** A high-performance, native FEA solver for linear static analysis.
 - **Bayesian Optimization:** Automatically optimizes lattice thickness to reduce stress concentrations.
 
-<img width="1917" height="1074" alt="LatticeMaker" src="https://github.com/user-attachments/assets/31cfa37f-26fb-4687-9e38-df9cc67c438d" />
+<img width="3750" height="2475" alt="LatticeMaker" src="https://github.com/user-attachments/assets/67eefc17-da42-4490-bda6-1878a999b6e3" />
 
 ## Installation
 
@@ -21,4 +21,5 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
    git clone [https://github.com/Hadimn77/LatticeMaker](https://github.com/Hadimn77/LatticeMaker.git)
 
    cd LatticeMaker
+
 
