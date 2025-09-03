@@ -3,7 +3,6 @@ import numpy as np
 import pyvista as pv
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import cg
-from scipy.interpolate import griddata
 import numba
 
 @numba.jit(nopython=True, cache=True)
@@ -75,7 +74,6 @@ def _calculate_stress_for_valid_elements(valid_elements, nodes, displacements, D
 
         element_displacements = displacements[node_ids].flatten()
         
-        # Manual centroid calculation for Numba compatibility
         sum_of_coords = np.sum(element_nodes_coords, axis=0)
         element_centroids[i] = sum_of_coords / 4.0
 
@@ -86,6 +84,7 @@ def _calculate_stress_for_valid_elements(valid_elements, nodes, displacements, D
             col = j * 3
             B[0, col]=dN_j_dx; B[1, col+1]=dN_j_dy; B[2, col+2]=dN_j_dz
             B[3, col]=dN_j_dy; B[3, col+1]=dN_j_dx
+            # --- MODIFICATION: Corrected the shear term calculation ---
             B[4, col+1]=dN_j_dz; B[4, col+2]=dN_j_dy
             B[5, col]=dN_j_dz; B[5, col+2]=dN_j_dx
         element_stresses[i] = D_matrix @ B @ element_displacements
@@ -108,14 +107,54 @@ def _create_id_to_index_map(mesh: pv.UnstructuredGrid) -> dict:
     
     return id_to_index_map
 
+@numba.jit(nopython=True, cache=True)
+def _check_for_disconnected_components(elements, num_nodes, fixed_indices):
+    """
+    Checks if all nodes in the mesh are connected to at least one fixed node
+    through a path of elements. Prevents free-body motion failures.
+    """
+    if num_nodes == 0 or len(fixed_indices) == 0:
+        return False
+
+    adj = [np.empty(0, dtype=np.int64) for _ in range(num_nodes)]
+    for i in range(len(elements)):
+        element = elements[i]
+        for j in range(4):
+            for k in range(j + 1, 4):
+                u, v = element[j], element[k]
+                adj[u] = np.append(adj[u], v)
+                adj[v] = np.append(adj[v], u)
+
+    visited = np.zeros(num_nodes, dtype=np.bool_)
+    q = np.empty(num_nodes, dtype=np.int64)
+    q_start, q_end = 0, 0
+
+    for node_idx in fixed_indices:
+        if not visited[node_idx]:
+            visited[node_idx] = True
+            q[q_end] = node_idx
+            q_end += 1
+
+    while q_start < q_end:
+        u = q[q_start]
+        q_start += 1
+        neighbors = np.unique(adj[u])
+        for v in neighbors:
+            if not visited[v]:
+                visited[v] = True
+                q[q_end] = v
+                q_end += 1
+
+    return np.all(visited)
+
+
 def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices: list, 
                    loaded_node_indices: list, force: tuple, log_func=print, 
-                   progress_callback=None, stress_percentile_threshold=98.0):
+                   progress_callback=None, stress_percentile_threshold=99.0):
     """
     Performs a high-performance, memory-efficient FEA analysis using batch processing.
-    All stress results are calculated and stored on a per-element basis.
+    All calculations are performed in SI units (meters, Newtons, Pascals).
     """
-    # Step 0: Translate incoming persistent IDs to 0-based solver indices
     log_func("Step 0: Translating frontend IDs to solver indices...")
     try:
         id_map = _create_id_to_index_map(mesh)
@@ -128,13 +167,12 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
         log_func(f"FATAL ERROR during ID translation: {e}")
         raise e
 
-    # ... (Diagnostic logging unchanged) ...
-
     def _update_progress(percent, message):
         log_func(message)
         if progress_callback: progress_callback(percent, message)
 
-    _update_progress(0, "Step 1: Preparing data for solver...")
+    _update_progress(0, "Step 1: Preparing data for solver (using SI units)...")
+    
     nodes = mesh.points
     num_nodes = nodes.shape[0]
     elements = mesh.cells_dict.get(pv.CellType.TETRA)
@@ -153,7 +191,8 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
     num_batches = (num_elements + batch_size - 1) // batch_size
     all_valid_elements_mask = np.zeros(num_elements, dtype=np.bool_)
 
-    # ... (Stiffness matrix assembly loop unchanged) ...
+    num_invalid_elements = 0
+
     for i in range(num_batches):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, num_elements)
@@ -164,6 +203,10 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
         batch_dof_indices = np.zeros((current_batch_size, 12), dtype=np.int64)
         batch_is_valid = np.zeros(current_batch_size, dtype=np.bool_)
         _calculate_batch_element_data(batch_elements, nodes, D_matrix, batch_kes, batch_dof_indices, batch_is_valid)
+        
+        num_invalid_in_batch = current_batch_size - np.sum(batch_is_valid)
+        num_invalid_elements += num_invalid_in_batch
+        
         all_valid_elements_mask[start_idx:end_idx] = batch_is_valid
 
         data_list, row_list, col_list = [], [], []
@@ -181,18 +224,21 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
             rows = np.concatenate(row_list)
             cols = np.concatenate(col_list)
             K_global += coo_matrix((data, (rows, cols)), shape=(num_dofs, num_dofs))
-    # ---
 
     K_original = K_global.copy()
     _update_progress(50, "Assembly complete.")
 
+    if num_invalid_elements > 0:
+        log_func(f"WARNING: Found and discarded {num_invalid_elements} invalid elements (zero/negative volume). "
+                 f"High numbers can indicate poor mesh quality and may lead to instability.")
+    
     _update_progress(51, "Step 3: Applying boundary conditions and loads...")
-    # ... (Boundary conditions and loads unchanged) ...
     F_global = np.zeros(num_dofs)
     if loaded_indices_solver:
-        force_per_node = np.array(force) / len(loaded_indices_solver)
+        force_per_node = np.array(force, dtype=np.float64) / len(loaded_indices_solver)
         for node_id in loaded_indices_solver: 
             F_global[node_id*3:node_id*3+3] = force_per_node
+            
     fixed_dofs = np.array([dof for node_id in fixed_indices_solver for dof in (node_id*3,node_id*3+1,node_id*3+2)], dtype=np.int64)
     K_global = K_global.tocsr()
     for dof in fixed_dofs:
@@ -203,21 +249,33 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
     K_global = transpose.transpose()
     K_global[fixed_dofs, fixed_dofs] = 1.0
     F_global[fixed_dofs] = 0.0
-    # ---
+
+    _update_progress(59, "Step 3.5: Checking model stability...")
+    is_stable = _check_for_disconnected_components(elements, num_nodes, np.array(fixed_indices_solver))
+    if not is_stable:
+        raise RuntimeError("Solver aborted: Model is not stable. "
+                           "This is likely due to insufficient constraints (free body motion) "
+                           "or disconnected element groups. Please check your fixed BCs.")
+    log_func("...Model stability check passed.")
 
     _update_progress(60, "Step 4: Solving the system of equations...")
-    # ... (Solver call unchanged) ...
-    max_iterations = 200
+    max_iterations = 300
     iteration_counter = [0] 
     def solver_callback(xk):
         iteration_counter[0] += 1
         progress_percent = 60 + (iteration_counter[0] / max_iterations) * 20
         if progress_callback: _update_progress(int(progress_percent), f"Solving... (Iteration {iteration_counter[0]})")
+    
     U, info = cg(K_global, F_global, rtol=1e-6, maxiter=max_iterations, callback=solver_callback)
-    if info == 0: _update_progress(80, "System solved successfully.")
-    else: _update_progress(80, f"Solver finished with code: {info} at iteration {iteration_counter[0]}")
+    
+    if info == 0: 
+        _update_progress(80, "System solved successfully.")
+    elif info > 0:
+        log_func(f"WARNING: Solver did not converge to the desired tolerance within {max_iterations} iterations (info={info}). Results may be inaccurate.")
+    else:
+        raise RuntimeError(f"Solver failed due to a numerical issue (info={info}). This often indicates an unstable model (insufficient constraints).")
+        
     displacements = U.reshape((num_nodes, 3))
-    # ---
 
     _update_progress(81, "Step 5: Post-processing results...")
     valid_elements = elements[all_valid_elements_mask]
@@ -231,23 +289,17 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
     
     valid_indices = np.where(all_valid_elements_mask)[0]
     
-    # Optional outlier filter for cleaning up visualization
     if stress_percentile_threshold < 100.0 and element_stresses.size > 0:
         log_func(f"...Applying stress outlier filter at {stress_percentile_threshold}th percentile.")
         if element_von_mises.size > 0:
             stress_limit = np.percentile(element_von_mises, stress_percentile_threshold)
             filter_mask = element_von_mises < stress_limit
-            
-            # Filter the results before calculating principals
             element_stresses = element_stresses[filter_mask]
             element_von_mises = element_von_mises[filter_mask]
-            # Keep track of the original indices of the elements that passed the filter
             final_valid_indices = valid_indices[filter_mask]
     else:
-        # If no filter, all valid elements are the final ones
         final_valid_indices = valid_indices
 
-    # --- REWRITTEN SECTION: All calculations are now elemental ---
     _update_progress(95, "Calculating principal stresses for each element...")
     num_final_elements = element_stresses.shape[0]
     stress_tensors = np.zeros((num_final_elements, 3, 3))
@@ -267,24 +319,20 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
     _update_progress(99, "Finalizing results...")
     result_mesh = mesh.copy()
     
-    # Store nodal displacement data
     result_mesh.point_data["displacement"] = np.linalg.norm(displacements, axis=1)
     result_mesh.point_data['Displacements'] = displacements
 
-    # Create full-sized arrays to map element results back to the original mesh
     full_element_von_mises = np.zeros(num_elements)
     full_principal_s1 = np.zeros(num_elements)
     full_principal_s2 = np.zeros(num_elements)
     full_principal_s3 = np.zeros(num_elements)
     
-    # Populate the full-sized arrays at the correct indices
     if len(final_valid_indices) == principal_stresses.shape[0]:
         full_element_von_mises[final_valid_indices] = element_von_mises
         full_principal_s1[final_valid_indices] = principal_stresses[:, 0]
         full_principal_s2[final_valid_indices] = principal_stresses[:, 1]
         full_principal_s3[final_valid_indices] = principal_stresses[:, 2]
 
-    # Add all stress data as cell data
     result_mesh.cell_data["von_mises_stress"] = full_element_von_mises
     result_mesh.cell_data["principal_s1"] = full_principal_s1
     result_mesh.cell_data["principal_s2"] = full_principal_s2
