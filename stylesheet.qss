@@ -1,226 +1,81 @@
 /*
- * Professional Dark-Blue Theme for PyQt5
+ * Professional CAE/CAD Dark Theme (Charcoal & Amber)
  */
 
 QWidget {
-    background-color: #2d2d2d;
-    color: #f0f0f0;
+    background-color: #2a2a2e; /* Charcoal background */
+    color: #e0e0e0; /* Light gray text */
     font-family: "Segoe UI", sans-serif;
     font-size: 10pt;
     border: none;
 }
 
-/* === Main Window & Generic Containers === */
-QMainWindow, QDialog {
-    background-color: #2d2d2d;
-}
-
+/* === Main Containers === */
 QGroupBox {
-    background-color: #3c3c3c;
-    border: 1px solid #555555;
+    background-color: #38383e;
+    border: 1px solid #4a4a4e;
     border-radius: 6px;
     margin-top: 12px;
 }
-
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top center;
     padding: 2px 8px;
-    background-color: #555555;
-    color: #f0f0f0;
+    background-color: #4a4a4e;
+    color: #e0e0e0;
     border-radius: 4px;
     font-weight: bold;
 }
 
-QFrame[frameShape="4"] /* QFrame.HLine */ {
-    border: none;
-    height: 1px;
-    background-color: #555555;
+/* === Input Fields === */
+QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+    background-color: #2a2a2e;
+    color: #e0e0e0;
+    border: 1px solid #4a4a4e;
+    border-radius: 4px;
+    padding: 4px;
 }
-
-/* === ToolBar & MenuBar === */
-QToolBar {
-    background-color: #353535;
-    border-right: 1px solid #555555;
-}
-
-QMenuBar {
-    background-color: #3c3c3c;
-}
-
-QMenuBar::item {
-    background-color: transparent;
-    padding: 4px 8px;
-}
-
-QMenuBar::item:selected {
-    background-color: #007acc;
-    color: #ffffff;
-}
-
-QMenu {
-    background-color: #3c3c3c;
-    border: 1px solid #555555;
-}
-
-QMenu::item {
-    padding: 4px 20px;
-}
-
-QMenu::item:selected {
-    background-color: #007acc;
-    color: #ffffff;
+QAbstractSpinBox:focus, QComboBox:focus, QTextEdit:focus {
+    border: 1px solid #ffb700; /* Amber highlight on focus */
 }
 
 /* === Buttons === */
 QPushButton {
-    background-color: #007acc;
+    background-color: #0078d4; /* Standard blue for actions */
     color: #ffffff;
     border-radius: 4px;
     padding: 6px 12px;
     min-height: 16px;
 }
-
 QPushButton:hover {
-    background-color: #0095ff;
+    background-color: #0089f0;
 }
-
 QPushButton:pressed {
-    background-color: #005b9e;
+    background-color: #006ac1;
+}
+/* Special button for primary actions */
+QPushButton#infill_button, QPushButton#run_fea_button, QPushButton#run_optimization_button {
+    background-color: #009e49; /* Green for "Go" buttons */
+}
+QPushButton#infill_button:hover, QPushButton#run_fea_button:hover, QPushButton#run_optimization_button:hover {
+    background-color: #00b353;
 }
 
-QPushButton:disabled {
-    background-color: #3a3a3a;
-    color: #777777;
-}
-
-QPushButton:checkable:checked {
-    background-color: #005b9e;
-    border: 1px solid #0095ff;
-}
-
-/* === Input Fields === */
-QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
-    background-color: #252525;
-    color: #f0f0f0;
-    border: 1px solid #555555;
-    border-radius: 4px;
-    padding: 4px;
-}
-
-QTextEdit {
-    padding: 6px;
-}
-
-QAbstractSpinBox:focus, QComboBox:focus, QTextEdit:focus {
-    border: 1px solid #007acc;
-}
-
-QAbstractSpinBox:disabled, QComboBox:disabled, QTextEdit:disabled {
-    background-color: #3a3a3a;
-    color: #777777;
-}
-
-/* QComboBox Arrow */
-QComboBox::drop-down {
-    subcontrol-origin: padding;
-    subcontrol-position: top right;
-    width: 20px;
-    border-left: 1px solid #555555;
-    border-top-right-radius: 3px;
-    border-bottom-right-radius: 3px;
-}
-QComboBox::down-arrow {
-    image: url(C:/Users/cflde/AppData/Local/Programs/Python/Python311/Lib/site-packages/PyQt5/Qt5/plugins/styles/qwindowsvistastyle.dll:downarrow.png); /* A standard arrow */
-}
-
-/* QSpinBox Arrows */
-QSpinBox::up-button, QDoubleSpinBox::up-button {
-    subcontrol-origin: border;
-    subcontrol-position: top right;
-    width: 16px;
-    border-left: 1px solid #555555;
-}
-
-QSpinBox::down-button, QDoubleSpinBox::down-button {
-    subcontrol-origin: border;
-    subcontrol-position: bottom right;
-    width: 16px;
-    border-left: 1px solid #555555;
-}
-
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow,
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    width: 10px;
-    height: 10px;
-}
-
-/* === CheckBox & RadioButton === */
-QCheckBox::indicator, QRadioButton::indicator {
-    width: 16px;
-    height: 16px;
-    border: 1px solid #555555;
-    border-radius: 4px;
-}
-
-QRadioButton::indicator {
-    border-radius: 9px;
-}
-
+/* === CheckBox & RadioButton Indicators === */
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {
-    background-color: #007acc;
-    border-color: #0095ff;
+    background-color: #0078d4;
+    border-color: #0089f0;
 }
 
-QCheckBox::indicator:unchecked:hover, QRadioButton::indicator:unchecked:hover {
-    border-color: #0095ff;
-}
-
-/* === ProgressBar & StatusBar === */
-QProgressBar {
-    border: 1px solid #555555;
-    border-radius: 4px;
-    text-align: center;
-    background-color: #252525;
-}
-
+/* === Progress Bar === */
 QProgressBar::chunk {
-    background-color: #007acc;
+    background-color: #0078d4;
     border-radius: 3px;
     margin: 1px;
 }
 
-QStatusBar {
-    background-color: #3c3c3c;
-    border-top: 1px solid #555555;
-}
-
-/* === ScrollBar === */
-QScrollBar:vertical {
-    background: #2d2d2d;
-    width: 12px;
-    margin: 0px;
-}
-
-QScrollBar::handle:vertical {
-    background: #555555;
-    min-height: 20px;
-    border-radius: 6px;
-}
-
-QScrollBar:horizontal {
-    background: #2d2d2d;
-    height: 12px;
-    margin: 0px;
-}
-
-QScrollBar::handle:horizontal {
-    background: #555555;
-    min-width: 20px;
-    border-radius: 6px;
-}
-
-QScrollBar::add-line, QScrollBar::sub-line {
-    height: 0px;
-    width: 0px;
+/* === Selections (Menus, etc.) === */
+QMenuBar::item:selected, QMenu::item:selected {
+    background-color: #ffb700; /* Amber for selections */
+    color: #1e1e1e; /* Dark text on amber */
 }
