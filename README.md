@@ -18,8 +18,9 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/Hadimn77/LatticeMaker](https://github.com/Hadimn77/LatticeMaker.git)
+   git clone https://github.com/Hadimn77/LatticeMaker.git
 
    cd LatticeMaker
+
 
 
