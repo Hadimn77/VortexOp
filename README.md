@@ -11,7 +11,8 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
 - **Robust Meshing:** Uses Gmsh for high-quality tetrahedral meshing with automatic pre-processing and repair.
 - **FEA Simulation:** A high-performance, native FEA solver for linear static analysis.
 - **Bayesian Optimization:** Automatically optimizes lattice thickness to reduce stress concentrations.
-<img width="1705" height="1125" alt="image" src="https://github.com/user-attachments/assets/0b6e08ff-fc2e-4cd6-a3a3-c08b77b1e7d6" />
+<img width="1705" height="1125" alt="image" src="https://github.com/user-attachments/assets/8fcd6c14-caa5-45a9-8064-36216c803c54" />
+
 ## Installation
 
 1. Clone the repository:
@@ -19,6 +20,7 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
    git clone https://github.com/Hadimn77/LatticeMaker.git
 
    cd LatticeMaker
+
 
 
 
