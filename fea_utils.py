@@ -29,6 +29,7 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
                                  skip_preprocessing=False,
                                  mesh_order: int = 1,
                                  optimize_ho: bool = False,
+                                 lattice_model: bool = False,
                                  algorithm: str = "HXT"):
     """
     Creates a robust tetrahedral volumetric mesh from a surface mesh using Gmsh.
@@ -40,53 +41,86 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
             log_func("WARNING: The input mesh must be high-quality and watertight for this to succeed.")
             final_surface = surface_mesh.triangulate()
         else:
-            log_func("Step 1/6: Validating and converting input mesh...", percent=5)
+            log_func("Step 1/6: Validating input mesh...", percent=5)
             if not isinstance(surface_mesh, pv.PolyData) or surface_mesh.n_points == 0 or surface_mesh.n_cells == 0:
-                return False, "Input to meshing function must be a valid PyVista PolyData mesh with points and cells."
-            faces = surface_mesh.faces.reshape(-1, 4)[:, 1:]
-            trimesh_mesh = trimesh.Trimesh(vertices=surface_mesh.points, faces=faces)
-            log_func("Step 2/6: Attempting to fill holes directly...", percent=20)
-            trimesh_mesh.fill_holes()
-            trimesh_mesh.process()
-            faces_padded = np.hstack([np.full((trimesh_mesh.faces.shape[0], 1), 3), trimesh_mesh.faces])
-            repaired_surface = pv.PolyData(trimesh_mesh.vertices, faces_padded)
-            log_func("Step 3/6: Applying adaptive simplification...", percent=40)
-            final_surface = repaired_surface.decimate_pro(
-                reduction=0.1, feature_angle=feature_angle, preserve_topology=True
-            )
-            final_surface = final_surface.smooth_taubin(n_iter=500, pass_band=0.05)
-            log_func("Step 4/6: Performing final repair with PyMeshFix...", percent=60)
-            meshfix = mf.MeshFix(final_surface.points, final_surface.faces.reshape(-1, 4)[:, 1:])
-            meshfix.repair()
-            final_surface = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
-            final_surface.clean(inplace=True).triangulate(inplace=True)
-        log_func("Step 5/6: Isolating the largest mesh component...", percent=75)
-        faces = final_surface.faces.reshape(-1, 4)[:, 1:]
-        trimesh_mesh_for_split = trimesh.Trimesh(vertices=final_surface.points, faces=faces)
-        components = trimesh_mesh_for_split.split(only_watertight=False)
-        if len(components) > 1:
-            log_func(f"...found {len(components)} disconnected parts. Selecting the largest by volume.")
-            component_volumes = [comp.volume for comp in components]
-            largest_component_trimesh = components[np.argmax(component_volumes)]
-            faces_padded = np.hstack([np.full((largest_component_trimesh.faces.shape[0], 1), 3), largest_component_trimesh.faces])
-            final_surface = pv.PolyData(largest_component_trimesh.vertices, faces_padded)
-        else:
-            log_func("...mesh is a single connected body.")
+                return False, "Input must be a valid PyVista PolyData mesh with points and cells."
+            
+            if lattice_model:
+                # --- AGGRESSIVE PIPELINE for lattice model (unchanged) ---
+                log_func("...mesh preprocssing pipeline for lattice model.")
+                faces = surface_mesh.faces.reshape(-1, 4)[:, 1:]
+                trimesh_mesh = trimesh.Trimesh(vertices=surface_mesh.points, faces=faces)
+
+                log_func("Step 2/6: Performing initial repairs...", percent=20)
+                #trimesh_mesh.fill_holes()
+                trimesh_mesh.process()
+                
+                faces_padded = np.hstack([np.full((trimesh_mesh.faces.shape[0], 1), 3), trimesh_mesh.faces])
+                repaired_surface = pv.PolyData(trimesh_mesh.vertices, faces_padded)
+
+                log_func("Step 3/6: Applying adaptive simplification...", percent=50)
+                simplified_surface = repaired_surface.decimate_pro(
+                    reduction=0.1, feature_angle=feature_angle, preserve_topology=True
+                )
+
+                log_func("Step 4/6: Applying smoothing and ...", percent=60)
+                final_surface = simplified_surface.smooth_taubin(n_iter=500, pass_band=0.05)
+                
+                log_func("Step 5/6: Ensuring mesh is watertight with PyMeshFix...", percent=80)
+                meshfix = mf.MeshFix(final_surface.points, final_surface.faces.reshape(-1, 4)[:, 1:])
+                meshfix.repair()
+                final_surface = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
+                final_surface.clean(inplace=True).triangulate(inplace=True)
+
+            else:
+                log_func("...using CONSERVATIVE mesh preprocssing pipeline for solid model.")
+                
+                log_func("Step 2/6: Analyzing mesh components...", percent=20)
+                faces = surface_mesh.faces.reshape(-1, 4)[:, 1:]
+                trimesh_mesh = trimesh.Trimesh(vertices=surface_mesh.points, faces=faces)
+
+                log_func("Step 3/6: Isolating the largest mesh component...", percent=35)
+                components = trimesh_mesh.split(only_watertight=False)
+                if len(components) > 1:
+                    log_func(f"...found {len(components)} disconnected parts. Selecting the largest by volume.")
+                    component_volumes = [comp.volume for comp in components]
+                    trimesh_mesh = components[np.argmax(component_volumes)]
+                
+                faces_padded = np.hstack([np.full((trimesh_mesh.faces.shape[0], 1), 3), trimesh_mesh.faces])
+                main_component_surface = pv.PolyData(trimesh_mesh.vertices, faces_padded)
+
+                log_func("Step 5/6: Performing watertight repair with PyMeshFix...", percent=60)
+                meshfix = mf.MeshFix(main_component_surface.points, main_component_surface.faces.reshape(-1, 4)[:, 1:])
+                meshfix.repair()
+                final_surface = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
+                final_surface.clean(inplace=True).triangulate(inplace=True)
+        
         if not final_surface.is_manifold:
             error_message = (
-                "The surface mesh is not watertight after adaptive repairs. "
+                "The surface mesh is not watertight after repairs. "
                 "This will likely cause the volumetric meshing to fail."
             )
             return False, error_message
+            
     except Exception as e:
         return False, f"A failure occurred during pre-processing: {e}"
 
     temp_dir = tempfile.mkdtemp()
     temp_stl_path = os.path.join(temp_dir, "temp_surface.stl")
-    gmsh.initialize()
+
+    # --- MODIFICATION START ---
+    # Initialize Gmsh only if it hasn't been started yet.
+    if not gmsh.isInitialized():
+        gmsh.initialize()
+    
+    # Clear any previous models from Gmsh's memory to ensure a clean state for this run.
+    gmsh.clear()
+    # --- MODIFICATION END ---
     
     log_func(f"...enabling parallel processing on {os.cpu_count()} threads.")
     gmsh.option.setNumber("General.NumThreads", os.cpu_count())
+    gmsh.option.setNumber("General.ExpertMode", 1)
+    # gmsh.option.setNumber("General.WorkSpace", 4096)
 
     try:
         final_surface.save(temp_stl_path)
@@ -129,7 +163,7 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
         gmsh.model.mesh.field.setNumber(base_size_field, "SizeMin", detail_size)
         max_size = volume_g_size if volume_g_size > detail_size else detail_size
         gmsh.model.mesh.field.setNumber(base_size_field, "SizeMax", max_size)
-        gmsh.model.mesh.field.setNumber(base_size_field, "DistMin", detail_size * 2.0)
+        gmsh.model.mesh.field.setNumber(base_size_field, "DistMin", 0)
         gmsh.model.mesh.field.setNumber(base_size_field, "DistMax", detail_size * 5.0)
         active_fields.append(base_size_field)
         
@@ -151,7 +185,6 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
         log_func("...applying advanced quality optimization routines.")
         gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
         gmsh.model.mesh.optimize("Laplace2D")
-        gmsh.model.mesh.optimize("Netgen")
         
         if mesh_order > 1:
             log_func(f"Setting mesh order to {mesh_order}.", percent=95)
@@ -195,7 +228,10 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
         error_details = f"GMSH ERROR: {gmsh_error}." if gmsh_error else f"An unexpected error occurred: {e}."
         return False, f"{error_details} The surface mesh may have defects. {saved_location_msg}"
     finally:
-        gmsh.finalize()
+        # --- MODIFICATION START ---
+        # Remove gmsh.finalize() to prevent terminating the engine during loops.
+        # The temporary directory is still cleaned up.
+        # --- MODIFICATION END ---
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir)
 
@@ -203,6 +239,7 @@ def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
     return True, vol_mesh
 
 def create_hexahedral_mesh(surface_mesh: pv.PolyData, voxel_size: float, log_func=print):
+    # This function is unchanged
     log_func(f"Voxelizing mesh with target voxel size: {voxel_size}")
     density = [
         (surface_mesh.bounds[1] - surface_mesh.bounds[0]) / voxel_size,
@@ -214,34 +251,14 @@ def create_hexahedral_mesh(surface_mesh: pv.PolyData, voxel_size: float, log_fun
     return voxel_grid
 
 def check_mesh_quality(mesh: pv.UnstructuredGrid, log_func=print):
-    """
-    Analyzes the quality of a volumetric mesh and returns a report.
-
-    Args:
-        mesh (pv.UnstructuredGrid): The volumetric mesh to check.
-        log_func (callable, optional): A function for logging progress.
-
-    Returns:
-        tuple: A tuple containing (is_pass, report_string).
-    """
+    # This function is unchanged
     if not isinstance(mesh, pv.UnstructuredGrid) or mesh.n_cells == 0:
         return False, "Mesh is empty or not a valid UnstructuredGrid."
 
-    # --- THIS SECTION IS CORRECTED FOR ROBUSTNESS ---
-    # The cell_quality() method returns a new mesh with the quality data
-    # stored in it as the active scalar array.
     mesh_with_quality = mesh.cell_quality(quality_measure='scaled_jacobian')
-    
-    # Access the active scalar array directly without relying on its name.
-    # This is the most robust method.
     quality_values = mesh_with_quality.active_scalars
-    
-    # Now perform calculations on the NumPy array of quality values.
     min_quality = quality_values.min()
     avg_quality = quality_values.mean()
-    # --- END OF CORRECTION ---
-    
-    # Set a reasonable quality threshold.
     quality_threshold = 0.1
 
     report = (
