@@ -221,16 +221,17 @@ def run_optimization_loop(
         current_lattice_params = {**lattice_params,
             'external_scalar': (full_target_points, full_scalar_values), 'use_scalar_for_thickness': True,
             'solidify': True, 'min_thickness_bound': min_thick_calculated,
-            'resoluiton': 100,
+            # DEBUG FIX 1: Corrected typo from 'resoluiton' to 'resolution'
+            'resolution': 100, 
             'max_thickness_bound': max_thick_suggested, 'lattice_type': lattice_type_suggested
         }
 
         remesh_params = {
             "remesh_enabled": True,
             "smoothing": "Taubin",
-            "smoothing_iterations": 50,
+            "smoothing_iterations": 500,
             "repair_methods": {
-                "Simplification": {"reduction": 0.4},
+                "Simplification": {"reduction": 0.2},
                 "Adaptive":{}
             }
         }
@@ -274,6 +275,11 @@ def run_optimization_loop(
             'loaded_node_indices': new_loaded_ids, 'force': force_vector_solver
         }
         result_mesh_solver = run_native_fea(**current_fea_params)
+
+        # DEBUG FIX 2: Added a check to handle FEA solver failure.
+        if result_mesh_solver is None:
+            log_func("FEA solver failed to produce a result. Applying penalty.", "error")
+            return 1e12
         
         # D. Convert FEA results to UI units and Save
         result_mesh_ui = result_mesh_solver.copy()
