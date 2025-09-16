@@ -1,9 +1,10 @@
-# lattice_utils.py (v5.03 – Corrected Trim-then-Union Logic)
+# lattice_utils.py (v5.03 – Corrected)
 import numpy as np
 import pyvista as pv
 import trimesh
 from packaging.version import parse
 from scipy.interpolate import griddata
+from numba import jit
 
 MIN_PYVISTA_VERSION = "0.38.0"
 assert parse(pv.__version__) >= parse(MIN_PYVISTA_VERSION), \
@@ -11,7 +12,8 @@ assert parse(pv.__version__) >= parse(MIN_PYVISTA_VERSION), \
     f"(found {pv.__version__}, but require >= {MIN_PYVISTA_VERSION}).\n" \
     f"Please configure your IDE to use the Python interpreter from your 'venv' folder."
 
-# ----------------------------- Lattice Implicit Functions -----------------------------
+# ----------------------------- Lattice Implicit Functions (Optimized with Numba) -----------------------------
+@jit(nopython=True, fastmath=True, parallel=True)
 def gyroid(x, y, z, wx, wy, wz):
     return (
         np.sin(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) +
@@ -19,12 +21,14 @@ def gyroid(x, y, z, wx, wy, wz):
         np.sin(2 * np.pi * z / wz) * np.cos(2 * np.pi * x / wx)
     )
 
+@jit(nopython=True, fastmath=True, parallel=True)
 def diamond(x, y, z, wx, wy, wz):
     return (
         np.cos(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) * np.cos(2 * np.pi * z / wz) -
         np.sin(2 * np.pi * x / wx) * np.sin(2 * np.pi * y / wy) * np.sin(2 * np.pi * z / wz)
     )
 
+@jit(nopython=True, fastmath=True, parallel=True)
 def neovius(x, y, z, wx, wy, wz):
     return (
         3 * (np.cos(2 * np.pi * x / wx) +
@@ -32,6 +36,15 @@ def neovius(x, y, z, wx, wy, wz):
              np.cos(2 * np.pi * z / wz)) +
         4 * np.cos(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) * np.cos(2 * np.pi * z / wz)
     )
+
+@jit(nopython=True, fastmath=True, parallel=True)
+def lidinoid(x, y, z, wx, wy, wz):
+    return (0.5 * (np.sin(2 * wx * x) * np.cos(wy * y) * np.sin(wz * z) +
+                    np.sin(2 * wy * y) * np.cos(wz * z) * np.sin(wx * x) +
+                    np.sin(2 * wz * z) * np.cos(wx * x) * np.sin(wy * y)) -
+            0.5 * (np.cos(2 * wx * x) * np.cos(2 * wy * y) +
+                    np.cos(2 * wy * y) * np.cos(2 * wz * z) +
+                    np.cos(2 * wz * z) * np.cos(2 * wx * x)))
 
 def generate_scalar_field(x, y, z, lattice_type='gyroid', wx=10, wy=10, wz=10):
     if lattice_type == 'gyroid':
@@ -58,7 +71,6 @@ def apply_remeshing(mesh: pv.PolyData, remesh_params: dict, log_func=print):
 
     log("Applying post-processing to lattice...")
 
-    # Keep the order: repair -> adapt -> smooth; avoid over-merge first
     if "Fill Holes" in repair_methods:
         log("...filling holes.")
         mesh = mesh.fill_holes(repair_methods["Fill Holes"]['hole_size'])
@@ -96,8 +108,6 @@ def _sdf_negative_inside(
 ) -> np.ndarray:
     """
     Force SDF to be NEGATIVE inside the mesh.
-    - Tries watertight check; if not, caps small holes; if still failing, uses tolerant test.
-    - Then enforces sign per-point (not just by mean), eliminating local sign flips near sharp edges.
     """
     log = log_func or (lambda *a, **k: None)
     dims = tuple(int(x) for x in grid.dimensions)
@@ -122,7 +132,6 @@ def _sdf_negative_inside(
 
     inside_mask = enclosed.point_data['SelectedPoints'].astype(bool).reshape(dims, order='F')
 
-    # Enforce sign pointwise: inside => negative; outside => positive
     abs_phi = np.abs(phi)
     phi_fixed = np.where(inside_mask, -abs_phi, abs_phi).astype(np.float32)
     return phi_fixed
@@ -170,30 +179,21 @@ def _filter_small_components(mesh: pv.PolyData, threshold_factor: float = 0.1, l
         
     except Exception as e:
         log(f"WARNING: Could not perform volume filtering due to an error: {e}")
-        return mesh # Return original mesh if filtering fails
+        return mesh
 
 # ----------------------------- Main Infill Generation -----------------------------
 def generate_infill_inside(mesh: pv.PolyData, **kwargs):
     """
     Unified implicit workflow using PyVista. Returns a single PyVista PolyData mesh.
-
-      1) Robust SDF of the outer surface (negative inside).
-      2) Lattice field (optionally scalar-driven).
-      3) IF SHELL: Generate a single, combined open-cell structure by uniting the
-         shell volume and the lattice field.
-      4) IF NO SHELL: Generate a single combined (closed-cell) lattice infill.
-      5) Filter and remesh the final structure.
     """
     log_func = kwargs.get('log_func', print)
     log = log_func or print
     log("--- Running Unified Implicit Workflow (PyVista Native) ---")
 
-    # User knobs
     shell_hole_factor = float(kwargs.get('shell_hole_factor', 0.02))
     bbox_pad_factor   = float(kwargs.get('bbox_pad_factor', 0.5))
     enclosed_tol = float(kwargs.get('enclosed_tolerance', 0.0))
 
-    # Pre-clean but preserve sharp features
     mesh = mesh.triangulate().clean()
 
     # --- Step 1: Grid (padded) ---
@@ -220,7 +220,6 @@ def generate_infill_inside(mesh: pv.PolyData, **kwargs):
 
     # --- Step 2: Base implicit fields ---
     log("Step 2/4: Generating base implicit fields...", percent=20)
-
     sdf_outer_1d = grid.compute_implicit_distance(mesh, inplace=False).point_data.active_scalars
     phi = _sdf_negative_inside(
         grid, mesh, sdf_outer_1d,
@@ -251,7 +250,11 @@ def generate_infill_inside(mesh: pv.PolyData, **kwargs):
             interp_vals = np.nan_to_num(interp_vals, nan=np.mean(values))
             vmin, vmax = float(np.min(interp_vals)), float(np.max(interp_vals))
             normalized = (interp_vals - vmin) / (vmax - vmin) if vmax > vmin else np.ones_like(interp_vals)
-            thickness_field = (normalized * thickness).reshape(grid.dimensions, order='F')
+            
+            min_bound = float(kwargs.get('min_thickness_bound', 0.2))
+            max_bound = float(kwargs.get('max_thickness_bound', thickness))
+            thickness_field = (normalized * (max_bound - min_bound) + min_bound).reshape(grid.dimensions, order='F')
+
             lattice_body_field = np.abs(lattice_field) - (thickness_field / 2.0)
         else:
             lattice_body_field = np.abs(lattice_field) - (float(thickness) / 2.0)
@@ -264,23 +267,12 @@ def generate_infill_inside(mesh: pv.PolyData, **kwargs):
     if kwargs.get('create_shell', False):
         log("...generating combined OPEN-CELL lattice and shell via TRIM-then-UNION.")
         t = float(kwargs['shell_thickness'])
-        
-        # Create the inner boundary by offsetting the main boundary SDF
         phi_inner = phi + t
-        
-        # 1. Define the implicit field for the shell body itself.
         shell_field = np.maximum(phi, -phi_inner)
-
-        # 2. Define the implicit field for the infill by trimming the lattice.
-        # This is a standard intersection of the lattice and the inner volume.
-        trimmed_lattice_field = np.maximum(phi_inner-t/2, lattice_body_field)
-        
-        # 3. UNITE the shell and the trimmed lattice using np.minimum.
+        trimmed_lattice_field = np.maximum(phi_inner - t / 2, lattice_body_field)
         final_field = np.minimum(shell_field, trimmed_lattice_field)
-
         grid.point_data['final'] = final_field.ravel(order='F')
         lattice_mesh_raw = grid.contour(isosurfaces=[0.0], scalars='final').triangulate().clean()
-
     else:
         log("...generating combined (closed-cell) lattice body via INTERSECTION.")
         final_field = np.maximum(phi, lattice_body_field)
@@ -298,7 +290,13 @@ def generate_infill_inside(mesh: pv.PolyData, **kwargs):
             "Increase resolution, reduce shell thickness, or check geometry integrity."
         )
 
-    lattice_mesh_final = apply_remeshing(lattice_mesh_filtered, kwargs.get('remesh_params', {}), log_func)
+    remesh_params = {
+        'remesh_enabled': kwargs.get('remesh_enabled', False),
+        'smoothing': kwargs.get('smoothing'),
+        'smoothing_iterations': kwargs.get('smoothing_iterations'),
+        'repair_methods': kwargs.get('repair_methods', {})
+    }
+    lattice_mesh_final = apply_remeshing(lattice_mesh_filtered, remesh_params, log_func)
 
     log("--- Workflow Complete ---", percent=100)
     return lattice_mesh_final
