@@ -135,6 +135,7 @@ def run_optimization_loop(
         initial_fea_mesh.point_data['persistent_ids'] = np.arange(initial_fea_mesh.n_points)
 
     # --- 1. Initial Setup ---
+    search_radius = meshing_params.get('detail_size', 1.0) * 2.0
     initial_ids = initial_fea_mesh.point_data['persistent_ids']
     fixed_mask = np.isin(initial_ids, fea_params.get("fixed_node_indices", []))
     loaded_mask = np.isin(initial_ids, fea_params.get("loaded_node_indices", []))
@@ -162,7 +163,7 @@ def run_optimization_loop(
     # --- 2. Define Optimization Search Space ---
     user_min_limit = optim_params.get('min_thickness', 0.5)
     user_max_limit = optim_params.get('max_thickness', 5.0)
-    available_lattice_types = optim_params.get('available_lattice_types', ['gyroid', 'diamond', 'lidinoid'])
+    available_lattice_types = optim_params.get('available_lattice_types', ['gyroid', 'diamond'])
     
     search_space = [
         Real(user_min_limit, user_max_limit, name='max_thick'),
@@ -181,7 +182,7 @@ def run_optimization_loop(
     iteration_data = {
         "counter": 0, "best_score": np.inf, "best_params": {},
         "best_mesh": initial_fea_mesh.copy(), "last_successful_mesh": initial_fea_mesh.copy(),
-        "results": {} # This will store the file paths for each iteration
+        "results": {}
     }
     
     def objective(params):
@@ -189,12 +190,9 @@ def run_optimization_loop(
         iteration_data["counter"] += 1
         
         iteration_paths = {
-            'scalar_path': '',
-            'lattice_path': '',
-            'fea_result_path': ''
+            'scalar_path': '', 'lattice_path': '', 'fea_result_path': ''
         }
         
-        # Unpack parameters and calculate thickness
         max_thick_suggested, lattice_type_suggested = params
         mass_reduction_ratio = optim_params.get('mass_reduction_ratio', 0.5)
         min_thick_bound = optim_params.get('min_thickness', 0.5)
@@ -205,7 +203,6 @@ def run_optimization_loop(
         log_func(f"Suggested: max_thick={max_thick_suggested:.3f}, type={lattice_type_suggested}")
         log_func(f"Calculated min_thick (ratio={mass_reduction_ratio}): {min_thick_calculated:.3f}")
 
-        # A. Generate and Save Scalar Field
         control_values = _map_stress_to_control_values(iteration_data["last_successful_mesh"], control_points_coords, unit_manager, log_func)
         full_scalar_values = _create_normalized_scalar_field(control_points_coords, control_values, full_target_points)
         
@@ -217,24 +214,12 @@ def run_optimization_loop(
         except Exception as e:
             log_func(f"WARNING: Could not save scalar field for iteration {iteration}. Reason: {e}", "warning")
 
-        # B. Generate and Save New Lattice Surface
         current_lattice_params = {**lattice_params,
             'external_scalar': (full_target_points, full_scalar_values), 'use_scalar_for_thickness': True,
             'solidify': True, 'min_thickness_bound': min_thick_calculated,
-            # DEBUG FIX 1: Corrected typo from 'resoluiton' to 'resolution'
-            'resolution': 100, 
             'max_thickness_bound': max_thick_suggested, 'lattice_type': lattice_type_suggested
         }
-
-        remesh_params = {
-            "remesh_enabled": True,
-            "smoothing": "Taubin",
-            "smoothing_iterations": 500,
-            "repair_methods": {
-                "Simplification": {"reduction": 0.2},
-                "Adaptive":{}
-            }
-        }
+        
         new_surface_mesh = generate_infill_inside(mesh=original_shell, log_func=log_func, **current_lattice_params, **remesh_params)
 
         if not new_surface_mesh or new_surface_mesh.n_points == 0:
@@ -246,24 +231,13 @@ def run_optimization_loop(
             iteration_paths['lattice_path'] = lattice_filename
         except Exception as e:
             log_func(f"WARNING: Could not save lattice mesh for iteration {iteration}. Reason: {e}", "warning")
-
-        # C. Create Volumetric Mesh and Run FEA
-        meshing_params = {
-            'detail_size': 1,
-            'feature_angle': 30.0,
-            'volume_g_size': 2,
-            'mesh_order': 1,
-            'optimize_ho': False,
-            'algorithm': 'HEX',
-            'skip_preprocessing': False,
-            'lattice_model': True
-        }
+        
         success, new_vol_mesh = create_robust_volumetric_mesh(surface_mesh=new_surface_mesh, **meshing_params, log_func=log_func)
         if not success:
             log_func("Volumetric meshing failed. Applying penalty.", "error"); return 1e12
 
-        new_fixed_ids = _remap_indices_by_proximity(new_vol_mesh, original_fixed_coords)
-        new_loaded_ids = _remap_indices_by_proximity(new_vol_mesh, original_loaded_coords)
+        new_fixed_ids = _remap_indices_by_proximity(new_vol_mesh, original_fixed_coords, search_radius)
+        new_loaded_ids = _remap_indices_by_proximity(new_vol_mesh, original_loaded_coords, search_radius)
         if not new_fixed_ids or not new_loaded_ids:
             log_func("Failed to remap boundary conditions. Applying penalty.", "error"); return 1e12
         
@@ -276,12 +250,10 @@ def run_optimization_loop(
         }
         result_mesh_solver = run_native_fea(**current_fea_params)
 
-        # DEBUG FIX 2: Added a check to handle FEA solver failure.
         if result_mesh_solver is None:
             log_func("FEA solver failed to produce a result. Applying penalty.", "error")
             return 1e12
         
-        # D. Convert FEA results to UI units and Save
         result_mesh_ui = result_mesh_solver.copy()
         result_mesh_ui.points = unit_manager.convert_from_solver(result_mesh_solver.points, 'length')
         if 'Displacements' in result_mesh_solver.point_data:
@@ -300,7 +272,6 @@ def run_optimization_loop(
         except Exception as e:
             log_func(f"WARNING: Could not save FEA result for iteration {iteration}. Reason: {e}", "warning")
 
-        # E. Calculate Objective Score
         max_stress_solver = get_robust_max_stress(result_mesh_solver)
         stress_limit_solver = unit_manager.convert_to_solver(optim_params.get('stress_limit', np.inf), 'pressure')
         if max_stress_solver > stress_limit_solver:
@@ -319,7 +290,6 @@ def run_optimization_loop(
         log_func(f"Mass Reduction: {current_mass_reduction:.2f}%")
         log_func(f"Scores: Performance={performance_score:.4f}, Volume={volume_score:.4f} -> Combined Objective={objective_score:.4f}")
         
-        # Store results if this is the best iteration so far
         if objective_score < iteration_data["best_score"]:
             iteration_data["best_score"] = objective_score
             iteration_data["best_params"] = {
@@ -330,7 +300,6 @@ def run_optimization_loop(
             log_func(f"*** New best design found with score: {objective_score:.4f} ***")
 
         iteration_data["last_successful_mesh"] = result_mesh_ui.copy()
-        # Store the paths for this iteration so the UI can load them
         iteration_data["results"][iteration] = iteration_paths
         
         return objective_score
@@ -358,10 +327,11 @@ def run_optimization_loop(
             log_func(f"Warning: Could not generate convergence plot. Reason: {e}", "warning")
 
     final_control_values = _map_stress_to_control_values(iteration_data["best_mesh"], control_points_coords, unit_manager, log_func)
-    best_scalar_field = _create_normalized_scalar_field(control_points_coords, final_control_values, full_target_points)
+    # FIX: Corrected to return the full scalar field, not just the control values
+    final_scalar_field_values = _create_normalized_scalar_field(control_points_coords, final_control_values, full_target_points)
 
     return (
-        (full_target_points, best_scalar_field),
+        (full_target_points, final_scalar_field_values),
         iteration_data["best_mesh"],
-        iteration_data["results"], # Return the dictionary of file paths
+        iteration_data["results"],
     )
