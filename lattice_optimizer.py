@@ -3,9 +3,6 @@ import numpy as np
 import pyvista as pv
 from scipy.interpolate import griddata
 from scipy.spatial import KDTree
-
-# --- Mock imports for demonstration purposes ---
-# In your actual project, replace these with your real utility modules.
 from lattice_utils import generate_infill_inside
 from fea_utils import create_robust_volumetric_mesh
 from fea_solver_core import run_native_fea
@@ -19,7 +16,6 @@ try:
 except ImportError:
     raise ImportError("Bayesian optimization requires 'scikit-optimize'. Please install it using: pip install scikit-optimize")
 
-# Add optional import for plotting
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
@@ -125,7 +121,7 @@ def run_optimization_loop(
     """
     Runs a deterministic Bayesian optimization, saving all intermediate results.
     """
-    log_func("--- Starting Advanced Bayesian Lattice Optimization ---")
+    log_func("--- Starting Bayesian Lattice Optimization ---")
 
     output_dir = "optimization_steps"
     os.makedirs(output_dir, exist_ok=True)
@@ -133,7 +129,7 @@ def run_optimization_loop(
     
     if 'persistent_ids' not in initial_fea_mesh.point_data:
         initial_fea_mesh.point_data['persistent_ids'] = np.arange(initial_fea_mesh.n_points)
-
+        
     # --- 1. Initial Setup ---
     search_radius = meshing_params.get('detail_size', 1.0) * 2.0
     initial_ids = initial_fea_mesh.point_data['persistent_ids']
@@ -217,6 +213,7 @@ def run_optimization_loop(
         current_lattice_params = {**lattice_params,
             'external_scalar': (full_target_points, full_scalar_values), 'use_scalar_for_thickness': True,
             'solidify': True, 'min_thickness_bound': min_thick_calculated,
+            'resolution': 100,
             'max_thickness_bound': max_thick_suggested, 'lattice_type': lattice_type_suggested
         }
         
@@ -232,12 +229,13 @@ def run_optimization_loop(
         except Exception as e:
             log_func(f"WARNING: Could not save lattice mesh for iteration {iteration}. Reason: {e}", "warning")
         
+        meshing_params = {'detail_size': 1,'feature_angle': 30,'volume_g_size': 2,'mesh_order': 1,'optimize_ho': False,'algorithm': 'HXT','skip_preprocessing': False, 'lattice_model': True}
         success, new_vol_mesh = create_robust_volumetric_mesh(surface_mesh=new_surface_mesh, **meshing_params, log_func=log_func)
         if not success:
             log_func("Volumetric meshing failed. Applying penalty.", "error"); return 1e12
 
-        new_fixed_ids = _remap_indices_by_proximity(new_vol_mesh, original_fixed_coords, search_radius)
-        new_loaded_ids = _remap_indices_by_proximity(new_vol_mesh, original_loaded_coords, search_radius)
+        new_fixed_ids = _remap_indices_by_proximity(new_vol_mesh, original_fixed_coords)
+        new_loaded_ids = _remap_indices_by_proximity(new_vol_mesh, original_loaded_coords)
         if not new_fixed_ids or not new_loaded_ids:
             log_func("Failed to remap boundary conditions. Applying penalty.", "error"); return 1e12
         
@@ -327,7 +325,6 @@ def run_optimization_loop(
             log_func(f"Warning: Could not generate convergence plot. Reason: {e}", "warning")
 
     final_control_values = _map_stress_to_control_values(iteration_data["best_mesh"], control_points_coords, unit_manager, log_func)
-    # FIX: Corrected to return the full scalar field, not just the control values
     final_scalar_field_values = _create_normalized_scalar_field(control_points_coords, final_control_values, full_target_points)
 
     return (
