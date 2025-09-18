@@ -59,8 +59,15 @@ def _create_normalized_scalar_field(control_points_coords, control_point_values,
         control_points_coords, control_point_values, full_target_points,
         method='linear', fill_value=np.mean(control_point_values)
     )
+
     np.clip(full_scalar_values, 0.0, 1.0, out=full_scalar_values)
-    return full_scalar_values
+
+    # Normalizing the scalar field to 0-1
+    max_scalar_value = np.max(full_scalar_values)
+    min_scalar_value = np.max(full_scalar_values)
+    normalized_scalar_field = (full_scalar_values - min_scalar_value)/(max_scalar_value - min_scalar_value)
+
+    return normalized_scalar_field
 
 def _map_stress_to_control_values(fea_mesh, control_points_coords, unit_manager, log_func):
     """Takes a mesh with stress data and maps it to normalized [0,1] control point values."""
