@@ -1,292 +1,268 @@
-# lattice_utils.py (v5.03 – Corrected)
+# fea_utils.py
 import numpy as np
 import pyvista as pv
 import trimesh
-from packaging.version import parse
-from scipy.interpolate import griddata
+import os
+import tempfile
+import gmsh
+import shutil
+from datetime import datetime
 
-MIN_PYVISTA_VERSION = "0.38.0"
-assert parse(pv.__version__) >= parse(MIN_PYVISTA_VERSION), \
-    f"CRITICAL ERROR: Your Python environment is using an old version of PyVista " \
-    f"(found {pv.__version__}, but require >= {MIN_PYVISTA_VERSION}).\n" \
-    f"Please configure your IDE to use the Python interpreter from your 'venv' folder."
+try:
+    import pymeshfix as mf
+except ImportError:
+    raise ImportError("The 'pymeshfix' library is required for mesh repair. Install with: pip install pymeshfix")
 
-# ----------------------------- Lattice Implicit Functions -----------------------------
-def gyroid(x, y, z, wx, wy, wz):
-    return (
-        np.sin(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) +
-        np.sin(2 * np.pi * y / wy) * np.cos(2 * np.pi * z / wz) +
-        np.sin(2 * np.pi * z / wz) * np.cos(2 * np.pi * x / wx)
-    )
+MATERIALS = {
+    "Titanium (Ti-6Al-4V)": {"ex": 113.8e9, "prxy": 0.342},
+    "Aluminum (7075-T6)": {"ex": 71.7e9, "prxy": 0.33},
+    "Stainless Steel (316L)": {"ex": 193e9, "prxy": 0.30},
+    "Structural Steel": {"ex": 200e9, "prxy": 0.30},
+}
 
-def diamond(x, y, z, wx, wy, wz):
-    return (
-        np.cos(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) * np.cos(2 * np.pi * z / wz) -
-        np.sin(2 * np.pi * x / wx) * np.sin(2 * np.pi * y / wy) * np.sin(2 * np.pi * z / wz)
-    )
-
-def neovius(x, y, z, wx, wy, wz):
-    return (
-        3 * (np.cos(2 * np.pi * x / wx) +
-             np.cos(2 * np.pi * y / wy) +
-             np.cos(2 * np.pi * z / wz)) +
-        4 * np.cos(2 * np.pi * x / wx) * np.cos(2 * np.pi * y / wy) * np.cos(2 * np.pi * z / wz)
-    )
-
-def generate_scalar_field(x, y, z, lattice_type='gyroid', wx=10, wy=10, wz=10):
-    if lattice_type == 'gyroid':
-        return gyroid(x, y, z, wx, wy, wz)
-    elif lattice_type == 'diamond':
-        return diamond(x, y, z, wx, wy, wz)
-    elif lattice_type == 'neovius':
-        return neovius(x, y, z, wx, wy, wz)
-    else:
-        raise ValueError(f"Unsupported lattice type: {lattice_type}")
-
-# ----------------------------- Utilities -----------------------------
-def convert_to_triangulated_polydata(grid: pv.UnstructuredGrid) -> pv.PolyData:
-    return grid.extract_surface().triangulate()
-
-def apply_remeshing(mesh: pv.PolyData, remesh_params: dict, log_func=print):
-    if not remesh_params.get('remesh_enabled', False):
-        return mesh
-
-    log = log_func or print
-    smoothing = remesh_params.get('smoothing', 'None')
-    smoothing_iterations = remesh_params.get('smoothing_iterations', 100)
-    repair_methods = remesh_params.get('repair_methods', {})
-
-    log("Applying post-processing to lattice...")
-
-    if "Fill Holes" in repair_methods:
-        log("...filling holes.")
-        mesh = mesh.fill_holes(repair_methods["Fill Holes"]['hole_size'])
-
-    if "Simplification" in repair_methods:
-        log("...simplifying mesh.")
-        if not mesh.is_all_triangles:
-            mesh = mesh.triangulate()
-        mesh = mesh.decimate_pro(repair_methods["Simplification"]['reduction'], preserve_topology=True)
-
-    if "Adaptive (Curvature)" in repair_methods:
-        log("...applying adaptive remeshing based on curvature.")
-        reduction = repair_methods.get("Adaptive (Curvature)", {}).get('reduction', 0.1)
-        feature_angle = repair_methods.get("Adaptive (Curvature)", {}).get('feature_angle', 100.0)
-        mesh = mesh.decimate_pro(reduction, preserve_topology=True, feature_angle=feature_angle)
-
-    if smoothing == "Laplacian":
-        log(f"...applying Laplacian smoothing ({smoothing_iterations} iterations).")
-        mesh = mesh.smooth(n_iter=smoothing_iterations, pass_band=0.05)
-    elif smoothing == "Taubin":
-        log(f"...applying Taubin smoothing ({smoothing_iterations} iterations).")
-        mesh = mesh.smooth_taubin(n_iter=smoothing_iterations, pass_band=0.05)
-
-    log("Post-processing completed.")
-    return mesh.triangulate().clean()
-
-# ----------------------------- Robust SDF Sign Helper -----------------------------
-def _sdf_negative_inside(
-    grid: pv.StructuredGrid,
-    mesh: pv.PolyData,
-    sdf_1d: np.ndarray,
-    log_func=None,
-    hole_factor: float = 0.02,
-    enclosed_tol: float = 0.0
-) -> np.ndarray:
+def create_robust_volumetric_mesh(surface_mesh: pv.PolyData,
+                                  detail_size: float,
+                                  feature_angle: float,
+                                  volume_g_size: float = 0.0,
+                                  refinement_region: list = None,
+                                  log_func=print,
+                                  skip_preprocessing=False,
+                                  mesh_order: int = 1,
+                                  optimize_ho: bool = False,
+                                  lattice_model: bool = False,
+                                  algorithm: str = "HXT"):
     """
-    Force SDF to be NEGATIVE inside the mesh.
+    Creates a robust tetrahedral volumetric mesh from a surface mesh using Gmsh.
+    Includes an automatic curvature-based refinement process.
     """
-    log = log_func or (lambda *a, **k: None)
-    dims = tuple(int(x) for x in grid.dimensions)
-    phi = np.asarray(sdf_1d, dtype=np.float32).reshape(dims, order='F')
-
-    def _select(m: pv.PolyData, check_surface: bool, tol: float):
-        return grid.select_enclosed_points(
-            m, check_surface=check_surface, tolerance=tol, inside_out=False
-        )
-
+    final_surface = None  # Ensure final_surface is defined in all code paths
     try:
-        enclosed = _select(mesh, check_surface=True, tol=enclosed_tol)
-    except Exception:
-        log("...surface not closed; attempting auto-repair (fill small holes).")
-        try:
-            hole_size = max(mesh.length * hole_factor, 1e-9)
-            repaired = mesh.triangulate().clean().fill_holes(hole_size).triangulate().clean()
-            enclosed = _select(repaired, check_surface=True, tol=enclosed_tol)
-        except Exception:
-            log("...falling back to tolerant inside test (approximate).")
-            enclosed = _select(mesh, check_surface=False, tol=max(enclosed_tol, 1e-9))
-
-    inside_mask = enclosed.point_data['SelectedPoints'].astype(bool).reshape(dims, order='F')
-
-    abs_phi = np.abs(phi)
-    phi_fixed = np.where(inside_mask, -abs_phi, abs_phi).astype(np.float32)
-    return phi_fixed
-
-# ----------------------------- Helpers -----------------------------
-def _expand_bounds(bounds, pad):
-    x0, x1, y0, y1, z0, z1 = bounds
-    return (x0 - pad, x1 + pad, y0 - pad, y1 + pad, z0 - pad, z1 + pad)
-
-def _filter_small_components(mesh: pv.PolyData, threshold_factor: float = 0.1, log_func=print):
-    """Splits mesh and removes components with volume < threshold * max_volume."""
-    if mesh.n_cells == 0:
-        return mesh
-
-    log = log_func or print
-    log("...filtering small disconnected lattice components...")
-    
-    try:
-        components = mesh.split_bodies()
-        if len(components) <= 1:
-            log("...no filtering needed (single component).")
-            return mesh
-
-        volumes = np.array([comp.volume for comp in components])
-        max_volume = np.max(volumes)
-        if max_volume == 0:
-            log("...no filtering needed (all components have zero volume).")
-            return mesh
-
-        volume_threshold = threshold_factor * max_volume
-        
-        filtered_meshes = [comp for comp, vol in zip(components, volumes) if vol >= volume_threshold]
-        num_removed = len(components) - len(filtered_meshes)
-        
-        if num_removed > 0:
-            log(f"...removed {num_removed} of {len(components)} components below volume threshold.")
+        if skip_preprocessing:
+            log_func("Skipping pre-processing steps as requested.")
+            log_func("WARNING: The input mesh must be high-quality and watertight for this to succeed.")
+            final_surface = surface_mesh.triangulate()
         else:
-            log("...no components were smaller than the threshold.")
+            log_func("Step 1/6: Validating input mesh...", percent=5)
+            if not isinstance(surface_mesh, pv.PolyData) or surface_mesh.n_points == 0 or surface_mesh.n_cells == 0:
+                return False, "Input must be a valid PyVista PolyData mesh with points and cells."
+            
+            # Use a consistent variable for the temporary mesh
+            repaired_mesh = surface_mesh.copy()
+            
+            if lattice_model:
+                # --- AGGRESSIVE PIPELINE for lattice model ---
+                log_func("...using AGGRESSIVE mesh preprocssing pipeline for lattice model.")
+                
+                log_func("Step 2/6: Performing initial repairs with PyMeshFix...", percent=20)
+                meshfix = mf.MeshFix(repaired_mesh.points, repaired_mesh.faces.reshape(-1, 4)[:, 1:])
+                meshfix.repair()
+                repaired_mesh = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
+                repaired_mesh.clean(inplace=True).triangulate(inplace=True)
 
-        if not filtered_meshes:
-            log("WARNING: All components were filtered out. Returning original mesh to avoid errors.")
-            return mesh
+                log_func("Step 3/6: Applying adaptive simplification...", percent=50)
+                simplified_surface = repaired_mesh.decimate_pro(
+                    reduction=0.1, feature_angle=feature_angle, preserve_topology=True
+                )
+
+                log_func("Step 4/6: Applying smoothing...", percent=60)
+                final_surface = simplified_surface.smooth_taubin(n_iter=500, pass_band=0.05)
+                
+                # Final check with PyMeshFix after smoothing
+                log_func("Step 5/6: Re-checking watertight status with PyMeshFix...", percent=80)
+                meshfix = mf.MeshFix(final_surface.points, final_surface.faces.reshape(-1, 4)[:, 1:])
+                meshfix.repair()
+                final_surface = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
+                final_surface.clean(inplace=True).triangulate(inplace=True)
+
+            else:
+                # --- CONSERVATIVE PIPELINE for solid model ---
+                log_func("...using CONSERVATIVE mesh preprocssing pipeline for solid model.")
+                
+                log_func("Step 2/6: Analyzing mesh components...", percent=20)
+                # Use trimesh to find the largest connected component
+                faces = surface_mesh.faces.reshape(-1, 4)[:, 1:]
+                trimesh_mesh = trimesh.Trimesh(vertices=surface_mesh.points, faces=faces)
+                components = trimesh_mesh.split(only_watertight=False)
+                if len(components) > 1:
+                    log_func(f"...found {len(components)} disconnected parts. Selecting the largest by volume.")
+                    component_volumes = [comp.volume for comp in components]
+                    trimesh_mesh = components[np.argmax(component_volumes)]
+                
+                faces_padded = np.hstack([np.full((trimesh_mesh.faces.shape[0], 1), 3), trimesh_mesh.faces])
+                repaired_mesh = pv.PolyData(trimesh_mesh.vertices, faces_padded)
+
+                log_func("Step 3/6: Performing watertight repair with PyMeshFix...", percent=60)
+                meshfix = mf.MeshFix(repaired_mesh.points, repaired_mesh.faces.reshape(-1, 4)[:, 1:])
+                meshfix.repair()
+                final_surface = pv.PolyData(meshfix.v, np.hstack((np.full((meshfix.f.shape[0], 1), 3), meshfix.f)))
+                final_surface.clean(inplace=True).triangulate(inplace=True)
+                log_func("Step 4/6: Pre-processing complete.", percent=80)
+
+        if not final_surface.is_manifold:
+            error_message = (
+                "The surface mesh is not watertight after repairs. "
+                "This will likely cause the volumetric meshing to fail. Try adjusting mesh repair parameters."
+            )
+            return False, error_message
+            
+    except Exception as e:
+        return False, f"A failure occurred during pre-processing: {e}"
+
+    temp_dir = tempfile.mkdtemp()
+    temp_stl_path = os.path.join(temp_dir, "temp_surface.stl")
+    gmsh.initialize()
+    
+    log_func(f"...enabling parallel processing on {os.cpu_count()} threads.")
+    gmsh.option.setNumber("General.NumThreads", os.cpu_count())
+
+    try:
+        final_surface.save(temp_stl_path)
+        gmsh.model.add("RobustMeshModel")
+        gmsh.merge(temp_stl_path)
+        log_func("Step 6/6: Generating 3D tetrahedral mesh with Gmsh...", percent=85)
+        angle_rad = feature_angle * np.pi / 180
+        gmsh.model.mesh.classifySurfaces(angle_rad, boundary=True, forReparametrization=True)
+        gmsh.model.geo.synchronize()
+        s = gmsh.model.getEntities(2)
+        if not s:
+            raise RuntimeError("Gmsh failed to create geometric surfaces from the mesh.")
+        surface_tags = [tag for dim, tag in s]
+        sl = gmsh.model.geo.addSurfaceLoop(surface_tags)
+        gmsh.model.geo.addVolume([sl])
+        gmsh.model.geo.synchronize()
+
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+        log_func(f"...setting 3D algorithm to '{algorithm}'.")
+        if algorithm == "Delaunay": gmsh.option.setNumber("Mesh.Algorithm3D", 1)
+        elif algorithm == "Netgen (Frontal)": gmsh.option.setNumber("Mesh.Algorithm3D", 4)
+        else: gmsh.option.setNumber("Mesh.Algorithm3D", 10)
+
+        active_fields = []
+        log_func("...configuring automatic mesh refinement.")
         
-        return pv.MultiBlock(filtered_meshes).combine(merge_points=True)
+        curvature_field = gmsh.model.mesh.field.add("Curvature")
+        curvature_size_field = gmsh.model.mesh.field.add("Threshold")
+        gmsh.model.mesh.field.setNumber(curvature_size_field, "InField", curvature_field)
+        gmsh.model.mesh.field.setNumber(curvature_size_field, "SizeMin", detail_size / 3.0)
+        gmsh.model.mesh.field.setNumber(curvature_size_field, "SizeMax", detail_size)
+        gmsh.model.mesh.field.setNumber(curvature_size_field, "DistMin", 0.1)
+        gmsh.model.mesh.field.setNumber(curvature_size_field, "DistMax", 2.0)
+        active_fields.append(curvature_size_field)
+
+        dist_field_base = gmsh.model.mesh.field.add("Distance")
+        gmsh.model.mesh.field.setNumbers(dist_field_base, "SurfacesList", surface_tags)
+        base_size_field = gmsh.model.mesh.field.add("Threshold")
+        gmsh.model.mesh.field.setNumber(base_size_field, "InField", dist_field_base)
+        gmsh.model.mesh.field.setNumber(base_size_field, "SizeMin", detail_size)
+        max_size = volume_g_size if volume_g_size > detail_size else detail_size
+        gmsh.model.mesh.field.setNumber(base_size_field, "SizeMax", max_size)
+        gmsh.model.mesh.field.setNumber(base_size_field, "DistMin", 0)
+        gmsh.model.mesh.field.setNumber(base_size_field, "DistMax", detail_size * 5.0)
+        active_fields.append(base_size_field)
+        
+        if refinement_region:
+            box_field = gmsh.model.mesh.field.add("Box")
+            box_vin = detail_size / 3.0
+            box_vout = volume_g_size if volume_g_size > detail_size else detail_size * 2
+            gmsh.model.mesh.field.setNumber(box_field, "VIn", box_vin); gmsh.model.mesh.field.setNumber(box_field, "VOut", box_vout)
+            gmsh.model.mesh.field.setNumber(box_field, "XMin", refinement_region[0]); gmsh.model.mesh.field.setNumber(box_field, "YMin", refinement_region[1]); gmsh.model.mesh.field.setNumber(box_field, "ZMin", refinement_region[2])
+            gmsh.model.mesh.field.setNumber(box_field, "XMax", refinement_region[3]); gmsh.model.mesh.field.setNumber(box_field, "YMax", refinement_region[4]); gmsh.model.mesh.field.setNumber(box_field, "ZMax", refinement_region[5])
+            active_fields.append(box_field)
+            
+        min_field = gmsh.model.mesh.field.add("Min")
+        gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", active_fields)
+        gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+            
+        gmsh.model.mesh.generate(3)
+        
+        log_func("...applying advanced quality optimization routines.")
+        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+        # gmsh.model.mesh.optimize("Netgen")
+        gmsh.model.mesh.optimize("Laplace2D")
+        
+        if mesh_order > 1:
+            log_func(f"Setting mesh order to {mesh_order}.", percent=95)
+            gmsh.model.mesh.setOrder(mesh_order)
+            if optimize_ho:
+                log_func("Optimizing high-order mesh...", percent=97)
+                gmsh.model.mesh.optimize("HighOrder")
+        
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+        node_coords = node_coords.reshape(-1, 3)
+        node_map = {tag: i for i, tag in enumerate(node_tags)}
+        elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(3)
+        if not elem_tags or not any(tags.size for tags in elem_node_tags):
+            raise RuntimeError("Gmsh generated a mesh but failed to produce any 3D elements.")
+        gmsh_to_vtk = {4: pv.CellType.TETRA, 11: pv.CellType.QUADRATIC_TETRA}
+        vtk_type_to_n_nodes = {pv.CellType.TETRA: 4, pv.CellType.QUADRATIC_TETRA: 10}
+        cells, cell_types = [], []
+        for gmsh_type, _, nodes in zip(elem_types, elem_tags, elem_node_tags):
+            vtk_type = gmsh_to_vtk.get(gmsh_type)
+            if vtk_type:
+                num_nodes_per_elem = vtk_type_to_n_nodes.get(vtk_type)
+                nodes_reshaped = nodes.reshape(-1, num_nodes_per_elem)
+                for element_nodes in nodes_reshaped:
+                    cells.extend([num_nodes_per_elem] + [node_map[n] for n in element_nodes])
+                    cell_types.append(vtk_type)
+        vol_mesh = pv.UnstructuredGrid(np.array(cells), np.array(cell_types), node_coords)
         
     except Exception as e:
-        log(f"WARNING: Could not perform volume filtering due to an error: {e}")
-        return mesh
+        gmsh_error = gmsh.logger.getLastError()
+        saved_location_msg = ""
+        if os.path.exists(temp_stl_path):
+            save_dir = os.getcwd()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_filename = f"latticemaker_debug_mesh_{timestamp}.stl"
+            debug_filepath = os.path.join(save_dir, debug_filename)
+            try:
+                shutil.copy(temp_stl_path, debug_filepath)
+                saved_location_msg = f"A copy of the problematic mesh has been saved: '{debug_filename}'"
+            except Exception as copy_e:
+                saved_location_msg = f"Could not save debug file due to: {copy_e}"
+        error_details = f"GMSH ERROR: {gmsh_error}." if gmsh_error else f"An unexpected error occurred: {e}."
+        return False, f"{error_details} The surface mesh may have defects. {saved_location_msg}"
+    finally:
+        gmsh.finalize()
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
 
-# ----------------------------- Main Infill Generation -----------------------------
-def generate_infill_inside(mesh: pv.PolyData, **kwargs):
-    """
-    Unified implicit workflow using PyVista. Returns a single PyVista PolyData mesh.
-    """
-    log_func = kwargs.get('log_func', print)
-    log = log_func or print
-    log("--- Running Unified Implicit Workflow (PyVista Native) ---")
+    log_func(f"Robust volumetric mesh created with {vol_mesh.n_cells} cells.", percent=100)
+    return True, vol_mesh
 
-    shell_hole_factor = float(kwargs.get('shell_hole_factor', 0.02))
-    bbox_pad_factor   = float(kwargs.get('bbox_pad_factor', 0.5))
-    enclosed_tol = float(kwargs.get('enclosed_tolerance', 0.0))
+def create_hexahedral_mesh(surface_mesh: pv.PolyData, voxel_size: float, log_func=print):
+    # This function is unchanged
+    log_func(f"Voxelizing mesh with target voxel size: {voxel_size}")
+    density = [
+        (surface_mesh.bounds[1] - surface_mesh.bounds[0]) / voxel_size,
+        (surface_mesh.bounds[3] - surface_mesh.bounds[2]) / voxel_size,
+        (surface_mesh.bounds[5] - surface_mesh.bounds[4]) / voxel_size,
+    ]
+    voxel_grid = pv.voxelize(surface_mesh, density=density)
+    log_func(f"Successfully created a hexahedral mesh with {voxel_grid.n_cells} cells.")
+    return voxel_grid
 
-    mesh = mesh.triangulate().clean()
+def check_mesh_quality(mesh: pv.UnstructuredGrid, log_func=print):
+    # This function is unchanged
+    if not isinstance(mesh, pv.UnstructuredGrid) or mesh.n_cells == 0:
+        return False, "Mesh is empty or not a valid UnstructuredGrid."
 
-    # --- Step 1: Grid (padded) ---
-    log("Step 1/4: Creating implicit grid...", percent=10)
-    resolution = int(kwargs['resolution'])
-    base_bounds = np.array(mesh.bounds, dtype=float)
+    mesh_with_quality = mesh.cell_quality(quality_measure='scaled_jacobian')
+    quality_values = mesh_with_quality.active_scalars
+    min_quality = quality_values.min()
+    avg_quality = quality_values.mean()
+    quality_threshold = 0.1
 
-    if resolution > 1:
-        dx = (base_bounds[1] - base_bounds[0]) / (resolution - 1)
-        dy = (base_bounds[3] - base_bounds[2]) / (resolution - 1)
-        dz = (base_bounds[5] - base_bounds[4]) / (resolution - 1)
-        min_spacing = max(min(dx, dy, dz), 1e-9)
-    else:
-        min_spacing = 1e-3
-
-    pad = bbox_pad_factor * min_spacing
-    bounds = _expand_bounds(base_bounds, pad)
-
-    xs = np.linspace(bounds[0], bounds[1], resolution)
-    ys = np.linspace(bounds[2], bounds[3], resolution)
-    zs = np.linspace(bounds[4], bounds[5], resolution)
-    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
-    grid = pv.StructuredGrid(X, Y, Z)
-
-    # --- Step 2: Base implicit fields ---
-    log("Step 2/4: Generating base implicit fields...", percent=20)
-    sdf_outer_1d = grid.compute_implicit_distance(mesh, inplace=False).point_data.active_scalars
-    phi = _sdf_negative_inside(
-        grid, mesh, sdf_outer_1d,
-        log_func=log, hole_factor=shell_hole_factor, enclosed_tol=enclosed_tol
+    report = (
+        f"--- Mesh Quality Report ---\n"
+        f"  Average Quality: {avg_quality:.3f}\n"
+        f"  Minimum Quality: {min_quality:.3f}\n"
+        f"  Acceptable Threshold: > {quality_threshold}\n"
+        f"--------------------------"
     )
-
-    current_wx, current_wy, current_wz = kwargs['wx'], kwargs['wy'], kwargs['wz']
-    if kwargs.get('use_scalar_for_cell_size') and kwargs.get('external_scalar'):
-        log("...applying variable cell size from scalar field...")
-        points, values = kwargs['external_scalar']
-        interp_vals = griddata(points, values, grid.points, method='linear')
-        interp_vals = np.nan_to_num(interp_vals, nan=np.mean(values))
-        vmin, vmax = float(np.min(interp_vals)), float(np.max(interp_vals))
-        norm = 0.5 + ((interp_vals - vmin) / (vmax - vmin)) if vmax - vmin > 1e-6 else np.ones_like(interp_vals)
-        norm_grid = norm.reshape(grid.dimensions, order='F')
-        current_wx *= norm_grid
-        current_wy *= norm_grid
-        current_wz *= norm_grid
-
-    lattice_field = generate_scalar_field(grid.x, grid.y, grid.z, kwargs['lattice_type'], current_wx, current_wy, current_wz)
-
-    if kwargs.get('solidify', False):
-        thickness = kwargs.get('thickness', 1.0)
-        if kwargs.get('use_scalar_for_thickness') and kwargs.get('external_scalar'):
-            log("...applying variable thickness from scalar field...")
-            points, values = kwargs['external_scalar']
-            interp_vals = griddata(points, values, grid.points, method='linear')
-            interp_vals = np.nan_to_num(interp_vals, nan=np.mean(values))
-            vmin, vmax = float(np.min(interp_vals)), float(np.max(interp_vals))
-            normalized = (interp_vals - vmin) / (vmax - vmin) if vmax > vmin else np.ones_like(interp_vals)
-            
-            # **MODIFICATION**: Correctly map the normalized scalar to user-defined bounds
-            min_bound = float(kwargs.get('min_thickness_bound', 0.2))
-            max_bound = float(kwargs.get('max_thickness_bound', thickness))
-            thickness_field = (normalized * (max_bound - min_bound) + min_bound).reshape(grid.dimensions, order='F')
-
-            lattice_body_field = np.abs(lattice_field) - (thickness_field / 2.0)
-        else:
-            lattice_body_field = np.abs(lattice_field) - (float(thickness) / 2.0)
+    
+    if min_quality < quality_threshold:
+        log_func("WARNING: Mesh quality is poor. Solver results may be inaccurate.")
+        return False, report
     else:
-        lattice_body_field = lattice_field
-
-    # --- Step 3: CSG and Surface Extraction ---
-    log("Step 3/4: Performing CSG and extracting surfaces...", percent=50)
-    
-    if kwargs.get('create_shell', False):
-        log("...generating combined OPEN-CELL lattice and shell via TRIM-then-UNION.")
-        t = float(kwargs['shell_thickness'])
-        phi_inner = phi + t
-        shell_field = np.maximum(phi, -phi_inner)
-        trimmed_lattice_field = np.maximum(phi_inner - t / 2, lattice_body_field)
-        final_field = np.minimum(shell_field, trimmed_lattice_field)
-        grid.point_data['final'] = final_field.ravel(order='F')
-        lattice_mesh_raw = grid.contour(isosurfaces=[0.0], scalars='final').triangulate().clean()
-    else:
-        log("...generating combined (closed-cell) lattice body via INTERSECTION.")
-        final_field = np.maximum(phi, lattice_body_field)
-        grid.point_data['final'] = final_field.ravel(order='F')
-        lattice_mesh_raw = grid.contour(isosurfaces=[0.0], scalars='final').triangulate().clean()
-
-    # --- Step 4: Filtering and Remeshing ---
-    log("Step 4/4: Filtering and remeshing final structure...", percent=80)
-    
-    lattice_mesh_filtered = _filter_small_components(lattice_mesh_raw, log_func=log)
-    
-    if lattice_mesh_filtered.n_points == 0:
-        raise RuntimeError(
-            "Implicit generation and filtering resulted in an empty lattice mesh. "
-            "Increase resolution, reduce shell thickness, or check geometry integrity."
-        )
-
-    # **MODIFICATION**: Correctly pass the remeshing parameters to the function.
-    # The calling code (e.g., main_window.py) provides these settings.
-    remesh_params = {
-        'remesh_enabled': kwargs.get('remesh_enabled', False),
-        'smoothing': kwargs.get('smoothing'),
-        'smoothing_iterations': kwargs.get('smoothing_iterations'),
-        'repair_methods': kwargs.get('repair_methods', {})
-    }
-    lattice_mesh_final = apply_remeshing(lattice_mesh_filtered, remesh_params, log_func)
-
-    log("--- Workflow Complete ---", percent=100)
-    return lattice_mesh_final
+        log_func("Mesh quality is acceptable.")
+        return True, report
