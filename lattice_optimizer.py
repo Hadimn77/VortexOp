@@ -347,7 +347,11 @@ def run_optimization_loop(
         max_stress_solver = get_robust_max_stress(result_mesh_solver)
         stress_limit_solver = unit_manager.convert_to_solver(optim_params.get('stress_limit', np.inf), 'pressure')
         if max_stress_solver > stress_limit_solver:
-            log_func("CONSTRAINT VIOLATED: Stress limit exceeded. Applying high penalty.", "error"); return 1e12
+            log_func("CONSTRAINT VIOLATED: Stress limit exceeded. Applying high penalty.", "error")
+            base_penalty = 100.0 
+            stress_penalty_scale = (max_stress_solver - stress_limit_solver) if stress_limit_solver > 1e-9 else 0
+            penalty = base_penalty * stress_penalty_scale
+            return penalty
 
         initial_max_stress_solver = unit_manager.convert_to_solver(initial_max_stress_ui, 'pressure')
         performance_score = max_stress_solver / initial_max_stress_solver if initial_max_stress_solver > 1e-9 else max_stress_solver
@@ -369,11 +373,11 @@ def run_optimization_loop(
                 'lattice_type': lattice_type_suggested, 'mass_reduction_achieved': current_mass_reduction
             }
             iteration_data["best_mesh"] = result_mesh_ui.copy()
+            iteration_data['best_mesh_iteration'] = iteration
             log_func(f"*** New best design found with score: {objective_score:.4f} ***")
 
         iteration_data["last_successful_mesh"] = result_mesh_ui.copy()
         iteration_data["results"][iteration] = iteration_paths
-        iteration_data['best_mesh_iteration'] = iteration
         
         return objective_score
 
