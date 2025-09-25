@@ -1,4 +1,4 @@
-# LatticeMaker
+# VortexOp
 
 A desktop application for generating, analyzing, and optimizing 3D lattice structures. Built with Python, PyQt5, PyVista, Gmsh, and a custom FEA solver accelerated with Numba.
 
@@ -20,6 +20,7 @@ A desktop application for generating, analyzing, and optimizing 3D lattice struc
    git clone https://github.com/Hadimn77/LatticeMaker.git
 
    cd LatticeMaker
+
 
 
 
