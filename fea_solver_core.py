@@ -108,6 +108,31 @@ def _calculate_stress_for_valid_elements(valid_elements, nodes, displacements, D
         
     return element_stresses
 
+@numba.jit(nopython=True, cache=True, parallel=True)
+def _calculate_strain_energy_for_valid_elements(valid_elements, nodes, displacements, D_matrix):
+    """
+    Calculates the strain energy for each valid element. Ue = 0.5 * u.T * ke * u
+    """
+    num_valid_elements = len(valid_elements)
+    element_strain_energy = np.zeros(num_valid_elements)
+
+    for i in numba.prange(num_valid_elements):
+        node_ids = valid_elements[i]
+        element_nodes_coords = nodes[node_ids]
+        
+        # Re-calculate the element stiffness matrix (ke) for this element
+        ke, is_valid = _get_element_stiffness_tet4(element_nodes_coords, D_matrix)
+        
+        if is_valid:
+            # Extract the 12 DOFs for this element from the global displacement vector
+            element_displacements_vec = displacements[node_ids].flatten()
+            
+            # Strain Energy Ue = 0.5 * ue.T * ke * ue
+            energy = 0.5 * (element_displacements_vec.T @ ke @ element_displacements_vec)
+            element_strain_energy[i] = energy
+            
+    return element_strain_energy
+
 @numba.jit(nopython=True, cache=True)
 def _average_element_stress_to_nodes(num_nodes, valid_elements, element_von_mises):
     """
@@ -178,7 +203,7 @@ def _run_bfs_check(num_nodes, adj_list, fixed_indices):
 
 def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices: list, 
                    loaded_node_indices: list, force: tuple, log_func=print, 
-                   progress_callback=None, stress_percentile_threshold=99.0,
+                   progress_callback=None, stress_percentile_threshold=90.0,
                    disp_node_data: dict = None):
     """
     Performs a high-performance, memory-efficient FEA analysis using a direct
@@ -244,8 +269,6 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
             for i in range(3):
                 U_p[node_id*3 + i] = disp_vector[i]
     
-    # Step 3.2: CORRECTLY identify all prescribed (p) and free (f) degrees of freedom (DOFs).
-    # This is the critical fix: Both fixed_dofs and disp_dofs must contain DOF indices.
     fixed_dofs = np.array([dof for node_id in fixed_indices_solver for dof in (node_id*3, node_id*3+1, node_id*3+2)], dtype=np.int64)
     disp_dofs = np.array([dof for node_id in disp_data_solver.keys() for dof in (node_id*3, node_id*3+1, node_id*3+2)], dtype=np.int64)
     prescribed_dofs = np.union1d(fixed_dofs, disp_dofs)
@@ -307,29 +330,96 @@ def run_native_fea(mesh: pv.UnstructuredGrid, material: dict, fixed_node_indices
 
     _update_progress(81, "Step 5: Post-processing results...")
     valid_elements = elements[all_valid_elements_mask]
+    
     element_stresses = _calculate_stress_for_valid_elements(valid_elements, nodes, displacements, D_matrix)
     element_von_mises = np.sqrt(0.5*((element_stresses[:,0]-element_stresses[:,1])**2 + (element_stresses[:,1]-element_stresses[:,2])**2 + (element_stresses[:,2]-element_stresses[:,0])**2) + 3*(element_stresses[:,3]**2 + element_stresses[:,4]**2 + element_stresses[:,5]**2))
     
+    # --- START: New Stress Filtering Logic ---
+    if element_von_mises.size > 1:
+        # Use the percentile from the function's arguments
+        percentile_value = np.percentile(element_von_mises, stress_percentile_threshold)
+        
+        # Find values *above* this percentile
+        high_stress_values = element_von_mises[element_von_mises > percentile_value]
+        
+        if high_stress_values.size > 0:
+            # Calculate the average of *only* those high values
+            filter_threshold = np.mean(high_stress_values)
+            log_func(f"...Stress filter activated: Values above {stress_percentile_threshold}th percentile ({percentile_value:.2e} Pa) will be capped at their average ({filter_threshold:.2e} Pa).")
+            
+            # Cap all values in element_von_mises at this new threshold
+            np.clip(element_von_mises, a_min=None, a_max=filter_threshold, out=element_von_mises)
+        else:
+            log_func(f"...Stress filter: No values found above {stress_percentile_threshold}th percentile. No capping applied.")
+    # --- END: New Stress Filtering Logic ---
+            
+    log_func("...Calculating elemental strain energy.")
+    element_strain_energy = _calculate_strain_energy_for_valid_elements(valid_elements, nodes, displacements, D_matrix)
+
     _update_progress(90, "Interpolating stress field to nodes...")
     nodal_von_mises = _average_element_stress_to_nodes(num_nodes, valid_elements, element_von_mises)
 
+    # --- START OF MODIFIED REACTION FORCE CALCULATION ---
+
     log_func("...Calculating reaction forces at constraints.")
     F_internal = K_original.dot(U)
-    F_reaction_vec = F_internal - F_applied
     
-    total_reaction_force = np.zeros(3)
-    if prescribed_dofs.size > 0:
-        for dof in prescribed_dofs:
-            total_reaction_force[dof % 3] += F_reaction_vec[dof]
+    # In a pure displacement case, F_applied is zero, so F_reaction = F_internal.
+    # For correctness in mixed-load cases, we should use: F_reaction = F_internal - F_applied
+    F_reaction_vec = F_internal - F_applied # F_applied was defined in the BC section
+
+    # --- NEW: Calculate reaction force on FIXED nodes only ---
+    total_reaction_force_fixed = np.zeros(3)
+    if fixed_dofs.size > 0:
+        # Select the reaction forces corresponding to the fixed DOFs
+        reactions_at_fixed_dofs = F_reaction_vec[fixed_dofs]
+        # Reshape into (num_fixed_nodes, 3) and sum along the columns (axis=0)
+        total_reaction_force_fixed = reactions_at_fixed_dofs.reshape(-1, 3).sum(axis=0)
+
+    # --- NEW: Calculate reaction force on DISPLACEMENT LOAD nodes only ---
+    total_reaction_force_disp = np.zeros(3)
+    if disp_dofs.size > 0:
+        # Select the reaction forces corresponding to the displacement-loaded DOFs
+        reactions_at_disp_dofs = F_reaction_vec[disp_dofs]
+        # Reshape and sum
+        total_reaction_force_disp = reactions_at_disp_dofs.reshape(-1, 3).sum(axis=0)
+
+    # Calculate the total reaction force for equilibrium check (should be ~zero)
+    total_reaction_force_system = F_reaction_vec.reshape(-1, 3).sum(axis=0)
     
+    # --- END OF MODIFIED REACTION FORCE CALCULATION ---
+
     _update_progress(99, "Finalizing results...")
     result_mesh = mesh.copy()
     result_mesh.point_data["Displacements"] = displacements
     result_mesh.point_data["displacement"] = np.linalg.norm(displacements, axis=1)
     result_mesh.point_data["von_mises_stress"] = nodal_von_mises
     result_mesh.set_active_vectors('Displacements')
-    result_mesh.field_data["total_reaction_force_N"] = total_reaction_force
-    log_func(f"Total Reaction Force (X,Y,Z): {total_reaction_force} N")
+
+    # Store elemental (cell) data by mapping results for valid elements back to the full cell array
+    full_strain_energy = np.zeros(len(elements))
+    full_strain_energy[all_valid_elements_mask] = element_strain_energy
+    result_mesh.cell_data["strain_energy"] = full_strain_energy
+    
+    full_von_mises = np.zeros(len(elements))
+    full_von_mises[all_valid_elements_mask] = element_von_mises
+    result_mesh.cell_data["von_mises_stress"] = full_von_mises
+
+    # --- NEW: Calculate and store total strain energy ---
+    total_strain_energy = np.sum(element_strain_energy)
+    result_mesh.field_data["total_strain_energy_J"] = total_strain_energy
+
+    # Store the new, more specific results
+    result_mesh.field_data["total_reaction_force_fixed_N"] = total_reaction_force_fixed
+    result_mesh.field_data["total_reaction_force_disp_load_N"] = total_reaction_force_disp
+    result_mesh.field_data["total_reaction_force_system_N"] = total_reaction_force_system
+
+    log_func("--- Force & Energy Analysis ---")
+    log_func(f"Reaction Force on FIXED nodes (X,Y,Z):   {total_reaction_force_fixed} N")
+    log_func(f"Reaction Force on DISP LOAD nodes (X,Y,Z): {total_reaction_force_disp} N")
+    log_func(f"Total System Reaction Force (X,Y,Z):   {total_reaction_force_system} N")
+    log_func(f"Total Strain Energy in model:            {total_strain_energy:.4f} J")
+
     _update_progress(100, "FEA simulation completed successfully.")
 
     return result_mesh
