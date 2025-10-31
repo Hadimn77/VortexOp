@@ -1,21 +1,22 @@
 # unit_utils.py
 
 # Base SI units for the solver
-SOLVER_UNITS = {'length': 'm', 'force': 'N', 'pressure': 'Pa'}
+SOLVER_UNITS = {'length': 'm', 'force': 'N', 'pressure': 'Pa', 'energy': 'J'}
 
 # Conversion factors FROM the base SI unit TO the target unit.
 # (e.g., 1 meter = 1000 mm)
 CONVERSION_FACTORS = {
     'length':   {'m': 1.0, 'mm': 1000.0, 'in': 39.3701},
     'force':    {'N': 1.0, 'lbf': 0.224809},
-    'pressure': {'Pa': 1.0, 'MPa': 1e-6, 'psi': 0.000145038}
+    'pressure': {'Pa': 1.0, 'MPa': 1e-6, 'psi': 0.000145038},
+    'energy':   {'J': 1.0, 'mJ': 1000.0}
 }
 
 # Definition of available unit systems
 SYSTEMS = {
-    'SI (m, N, Pa)':         {'length': 'm',   'force': 'N',   'pressure': 'Pa'},
-    'Metric (mm, N, MPa)':   {'length': 'mm',  'force': 'N',   'pressure': 'MPa'},
-    'Imperial (in, lbf, psi)': {'length': 'in',  'force': 'lbf', 'pressure': 'psi'}
+    'SI (m, N, Pa)':         {'length': 'm',   'force': 'N',   'pressure': 'Pa',  'energy': 'J'},
+    'Metric (mm, N, MPa)':   {'length': 'mm',  'force': 'N',   'pressure': 'MPa', 'energy': 'mJ'},
+    'Imperial (in, lbf, psi)': {'length': 'in',  'force': 'lbf', 'pressure': 'psi', 'energy': 'J'}
 }
 
 class UnitManager:
