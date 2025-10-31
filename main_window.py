@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QStyle, QHBoxLayout, QFrame, QMessageBox, QScrollArea, QRadioButton, QButtonGroup,
     QDockWidget, QSizePolicy, QSlider, QToolButton, QMenu, QActionGroup
 )
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QTimer, QEventLoop
 from PyQt5.QtGui import QIcon
 import numpy as np
 import pyvista as pv
@@ -27,6 +27,7 @@ from lattice_optimizer import run_optimization_loop
 from export_utils import export_model
 from unit_utils import UnitManager, SYSTEMS
 from fea_solver_core import run_native_fea
+import re
 
 # Dependency checks
 try:
@@ -177,7 +178,7 @@ class LatticeMakerWindow(QMainWindow):
                 self.dx_spin, self.dy_spin, self.dz_spin
             ],
             'pressure': [
-                self.optim_stress_limit_spin
+                self.optim_stress_limit_spin, self.ex_spin
             ],
             'force': [
                 self.fx_spin, self.fy_spin, self.fz_spin
@@ -185,6 +186,7 @@ class LatticeMakerWindow(QMainWindow):
         }
         pv.set_plot_theme('dark')
         self.plotter.set_background('#FFFFFF')
+        self.plotter.enable_parallel_projection() # <-- 1. SET PARALLEL/ORTHOGRAPHIC VIEW
         self._create_layouts()
         self._create_menu_bar()
         self._setup_ui()    
@@ -210,6 +212,9 @@ class LatticeMakerWindow(QMainWindow):
         self.optim_iteration_selector.setVisible(False)
         self.optim_iteration_selector_label.setVisible(False)
         self._show_toolbox('lattice')
+        self._on_thickness_control_changed()
+        self._on_material_change(self.material_combo.currentText())
+        self._on_solidify_toggled(self.solidify_checkbox.isChecked())
         self._update_ui_for_units()    
 
     def _check_dependencies(self):
@@ -228,12 +233,14 @@ class LatticeMakerWindow(QMainWindow):
         self.optim_group = QGroupBox("Lattice Optimization")
         self.view_group = QGroupBox("View Controls")
 
-        self.lattice_type_box = QComboBox(); self.lattice_type_box.addItems(['gyroid', 'diamond', 'neovius', 'lidinoid'])
+        self.lattice_type_box = QComboBox(); self.lattice_type_box.addItems(['gyroid', 'diamond', 'neovius', 'lidinoid', 'schwarz_P'])
         self.resolution_spin = QDoubleSpinBox(); self.resolution_spin.setRange(0.01, 10.0); self.resolution_spin.setValue(1.0)
         self.suggest_resolution_button = QPushButton("Auto-resolution")
         self.unit_x_spin = QDoubleSpinBox(); self.unit_x_spin.setRange(0.01, 100.0); self.unit_x_spin.setValue(10.0)
         self.unit_y_spin = QDoubleSpinBox(); self.unit_y_spin.setRange(0.01, 100.0); self.unit_y_spin.setValue(10.0)
         self.unit_z_spin = QDoubleSpinBox(); self.unit_z_spin.setRange(0.01, 100.0); self.unit_z_spin.setValue(10.0)
+        self.use_volume_fraction_check = QCheckBox("Use Volume Fraction")
+        self.volume_fraction_spin = QDoubleSpinBox(); self.volume_fraction_spin.setRange(0.01, 0.99); self.volume_fraction_spin.setValue(0.20); self.volume_fraction_spin.setSingleStep(0.05); self.volume_fraction_spin.setDecimals(3)
         self.lattice_thickness_spin = QDoubleSpinBox(); self.lattice_thickness_spin.setRange(0.01, 10.0); self.lattice_thickness_spin.setValue(1.0)
         self.solidify_checkbox = QCheckBox("Solidify Lattice"); self.shell_checkbox = QCheckBox("Create Shell")
         self.shell_thickness_spin = QDoubleSpinBox(); self.shell_thickness_spin.setRange(0.1, 50.0); self.shell_thickness_spin.setValue(1.0)
@@ -259,7 +266,10 @@ class LatticeMakerWindow(QMainWindow):
         self.feature_angle_label = QLabel("Feature Angle:")
         self.feature_angle_spin = QDoubleSpinBox(); self.feature_angle_spin.setRange(10.0, 120.0); self.feature_angle_spin.setValue(45.0); self.feature_angle_spin.setSingleStep(5.0)
         self.skip_preprocessing_check = QCheckBox("Skip Pre-processing & Repair"); self.skip_preprocessing_check.setToolTip("WARNING: Only use this for high-quality, watertight models.\nSkipping this step on a flawed model will likely cause meshing to fail.")
-        self.material_combo = QComboBox(); self.material_combo.addItems(MATERIALS.keys())
+        self.material_combo = QComboBox(); self.material_combo.addItems(list(MATERIALS.keys()) + ["Custom"])
+        self.custom_material_group = QGroupBox("Custom Material Properties")
+        self.ex_spin = QDoubleSpinBox(); self.ex_spin.setRange(1e3, 1e12); self.ex_spin.setDecimals(2); self.ex_spin.setSingleStep(1e9)
+        self.prxy_spin = QDoubleSpinBox(); self.prxy_spin.setRange(-0.5, 0.5); self.prxy_spin.setDecimals(2); self.prxy_spin.setSingleStep(0.3)
         self.fx_spin = QDoubleSpinBox(); self.fx_spin.setRange(-1e9, 1e9)
         self.fy_spin = QDoubleSpinBox(); self.fy_spin.setRange(-1e9, 1e9)
         self.fz_spin = QDoubleSpinBox(); self.fz_spin.setRange(-1e9, 1e9); self.fz_spin.setValue(-1000)
@@ -294,7 +304,7 @@ class LatticeMakerWindow(QMainWindow):
         self.optim_max_thickness_spin = QDoubleSpinBox(); self.optim_max_thickness_spin.setRange(0.1, 20.0); self.optim_max_thickness_spin.setValue(2.0); self.optim_max_thickness_spin.setDecimals(2)
         self.run_optimization_button = QPushButton("Run Optimization"); self.run_optimization_button.setIcon(QApplication.style().standardIcon(QStyle.SP_CommandLink))
         self.run_optimization_button.setObjectName("run_optimization_button")
-        self.optim_objective_combo = QComboBox(); self.optim_objective_combo.addItems(["Minimize Max Stress", "Minimize Max Displacement"])
+        self.optim_objective_combo = QComboBox(); self.optim_objective_combo.addItems(["Minimize Max Stress", "Maximize Strain Energy", "Minimize Max Displacement"])
         self.mass_reduction_slider = QSlider(Qt.Horizontal)
         self.mass_reduction_slider.setRange(0, 100)
         self.mass_reduction_slider.setValue(50)
@@ -303,13 +313,25 @@ class LatticeMakerWindow(QMainWindow):
         self.optim_disp_limit_spin = QDoubleSpinBox(); self.optim_disp_limit_spin.setRange(0.001, 1000.0); self.optim_disp_limit_spin.setDecimals(2)
         self.use_fea_stress_button = QPushButton("Use FEA Stress as Scalar Field")
 
+        # --- NEW WIDGETS ---
+        self.optim_scalar_source_group = QGroupBox("Scalar Field Source for Thickness")
+        self.optim_scalar_stress_radio = QRadioButton("von Mises Stress"); self.optim_scalar_stress_radio.setChecked(True)
+        self.optim_scalar_energy_radio = QRadioButton("Strain Energy")
+        scalar_source_layout = QHBoxLayout()
+        scalar_source_layout.addWidget(self.optim_scalar_stress_radio)
+        scalar_source_layout.addWidget(self.optim_scalar_energy_radio)
+        self.optim_scalar_source_group.setLayout(scalar_source_layout)
+        # --- END NEW WIDGETS ---
+
         self.view_selector = QComboBox(); self.view_selector.addItems(["CAD", "Result", "Volumetric Mesh", "FEA Result", "Optimized Result"])
-        self.fea_result_selector = QComboBox(); self.fea_result_selector.addItems(["von_mises_stress", "displacement"]); self.fea_result_selector.setVisible(False)
+        self.fea_result_selector = QComboBox(); self.fea_result_selector.addItems(["von_mises_stress", "displacement", "strain_energy"]); self.fea_result_selector.setVisible(False)
         self.clipping_plane_button = QPushButton("Clipping Tool Settings")
         self.show_voxel_preview_check = QCheckBox("Show Voxel Preview")
         self.show_scalar_field_check = QCheckBox("Show Scalar Field")
         self.show_deformation_check = QCheckBox("Show Deformed Shape")
-        self.deformation_scale_spin = QDoubleSpinBox(); self.deformation_scale_spin.setRange(0, 1e6); self.deformation_scale_spin.setValue(100.0); self.deformation_scale_spin.setSingleStep(10); self.deformation_scale_spin.setDecimals(1)
+        self.animate_deformation_button = QPushButton("Animate Deformation")
+        self.animate_deformation_button.setIcon(QApplication.style().standardIcon(QStyle.SP_MediaPlay))
+        self.deformation_scale_spin = QDoubleSpinBox(); self.deformation_scale_spin.setRange(0, 1e6); self.deformation_scale_spin.setValue(1.0); self.deformation_scale_spin.setSingleStep(10); self.deformation_scale_spin.setDecimals(1)
         self.deformation_scale_label = QLabel("Deformation Scale:")
         self.show_optim_fea_check = QCheckBox("Show FEA Result")
         
@@ -344,6 +366,14 @@ class LatticeMakerWindow(QMainWindow):
         self.ribbon.addAction(self._create_ribbon_action("FEA", style.standardIcon(QStyle.SP_ComputerIcon), 'fea'))
         self.ribbon.addAction(self._create_ribbon_action("Optimize", style.standardIcon(QStyle.SP_CommandLink), 'optim'))
         self.ribbon.addAction(self._create_ribbon_action("View", style.standardIcon(QStyle.SP_DesktopIcon), 'view'))
+
+        # --- 2. CREATE AND ADD NEW VIEW TOOLBAR ---
+        self.view_toolbar = QToolBar("View Navigation")
+        self.view_toolbar.setIconSize(QSize(24, 24))
+        self.view_toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.addToolBar(Qt.TopToolBarArea, self.view_toolbar)
+        self._populate_view_toolbar()
+        # --- END NEW ---
 
         self.settings_dock = QDockWidget("Toolbox Settings", self)
         self.settings_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
@@ -399,7 +429,14 @@ class LatticeMakerWindow(QMainWindow):
         resolution_layout = QHBoxLayout(); resolution_layout.addWidget(self.resolution_spin); resolution_layout.addWidget(self.suggest_resolution_button)
         lattice_layout.addRow("Resolution:", resolution_layout)
         lattice_layout.addRow("Cell X:", self.unit_x_spin); lattice_layout.addRow("Cell Y:", self.unit_y_spin); lattice_layout.addRow("Cell Z:", self.unit_z_spin)
-        lattice_layout.addRow(self.solidify_checkbox); lattice_layout.addRow("Lattice Thickness:", self.lattice_thickness_spin)
+        lattice_layout.addRow(self.solidify_checkbox); 
+        self.lattice_thickness_label = QLabel("Lattice Thickness:")
+
+        self.volume_fraction_label = QLabel("Target Volume Fraction:")
+        lattice_layout.addRow(self.lattice_thickness_label, self.lattice_thickness_spin)
+        lattice_layout.addRow(self.use_volume_fraction_check)
+        lattice_layout.addRow(self.volume_fraction_label, self.volume_fraction_spin)
+        
         lattice_layout.addRow(self.shell_checkbox); self.shell_thickness_label = QLabel("Shell Thickness:"); lattice_layout.addRow(self.shell_thickness_label, self.shell_thickness_spin)
         lattice_layout.addRow(self.use_scalar_for_cell_size_checkbox); lattice_layout.addRow(self.use_scalar_checkbox); lattice_layout.addRow(self.scalar_button)
         lattice_layout.addRow(self.remesh_button); lattice_layout.addRow(self.infill_button)
@@ -430,6 +467,11 @@ class LatticeMakerWindow(QMainWindow):
         line1 = QFrame(); line1.setFrameShape(QFrame.HLine); line1.setFrameShadow(QFrame.Sunken); fea_layout.addRow(line1)
         fea_layout.addRow(QLabel("<b>Simulation Setup</b>"))
         fea_layout.addRow("Material:", self.material_combo)
+        custom_mat_layout = QFormLayout()
+        custom_mat_layout.addRow("Young's Modulus (E):", self.ex_spin)
+        custom_mat_layout.addRow("Poisson's Ratio (ν):", self.prxy_spin)
+        self.custom_material_group.setLayout(custom_mat_layout)
+        fea_layout.addRow(self.custom_material_group)
         self.force_label = QLabel("Force (N):")    
         self.force_label.setObjectName("force_label")
         force_layout = QHBoxLayout(); force_layout.addWidget(QLabel("Fx")); force_layout.addWidget(self.fx_spin); force_layout.addWidget(QLabel("Fy")); force_layout.addWidget(self.fy_spin); force_layout.addWidget(QLabel("Fz")); force_layout.addWidget(self.fz_spin)
@@ -468,12 +510,17 @@ class LatticeMakerWindow(QMainWindow):
         optim_layout.addRow("Min Thickness:", self.optim_min_thickness_spin)
         optim_layout.addRow("Max Thickness:", self.optim_max_thickness_spin)
         optim_layout.addRow("Max Iterations:", self.optim_max_iter_spin)
-        optim_layout.addRow(self.use_fea_stress_button)
+        optim_layout.addRow(self.optim_scalar_source_group)
         optim_layout.addRow(self.run_optimization_button)
 
     def _populate_view_group(self):
         view_layout = QFormLayout(self.view_group)
-        view_layout.addRow(self.show_deformation_check)
+        
+        deform_controls_layout = QHBoxLayout()
+        deform_controls_layout.addWidget(self.show_deformation_check)
+        deform_controls_layout.addWidget(self.animate_deformation_button)
+        view_layout.addRow(deform_controls_layout)
+
         view_layout.addRow(self.deformation_scale_label, self.deformation_scale_spin)
         view_layout.addRow("View Mode:", self.view_selector)
         view_layout.addRow(self.optim_iteration_selector_label, self.optim_iteration_selector)
@@ -482,6 +529,48 @@ class LatticeMakerWindow(QMainWindow):
         view_layout.addRow(self.show_scalar_field_check)
         view_layout.addRow(self.show_voxel_preview_check)
         view_layout.addRow(self.clipping_plane_button)
+
+    # --- 3. ADD NEW METHOD TO POPULATE THE VIEW TOOLBAR ---
+    def _populate_view_toolbar(self):
+        style = self.style()
+        
+        def _create_view_action(text, icon, callback, tooltip=None):
+            action = QAction(icon, text, self)
+            if tooltip:
+                action.setToolTip(tooltip)
+            action.triggered.connect(callback)
+            return action
+
+        self.view_toolbar.addAction(_create_view_action(
+            "Top", 
+            style.standardIcon(QStyle.SP_ArrowDown), 
+            lambda: self.plotter.view_xy(),
+            "Top View (Look down Z-axis)"
+        ))
+
+        self.view_toolbar.addAction(_create_view_action(
+            "Front", 
+            style.standardIcon(QStyle.SP_ArrowForward), 
+            lambda: self.plotter.view_xz(),
+            "Front View (Look down Y-axis)"
+        ))
+
+        self.view_toolbar.addAction(_create_view_action(
+            "Side", 
+            style.standardIcon(QStyle.SP_ArrowRight), 
+            lambda: self.plotter.view_yz(),
+            "Side View (Look down X-axis)"
+        ))
+        
+        self.view_toolbar.addSeparator()
+
+        self.view_toolbar.addAction(_create_view_action(
+            "Isometric", 
+            style.standardIcon(QStyle.SP_DirHomeIcon), 
+            lambda: self.plotter.view_isometric(),
+            "Isometric View"
+        ))
+    # --- END NEW METHOD ---
 
     def _create_layouts(self):
         main_layout = QVBoxLayout()
@@ -509,6 +598,8 @@ class LatticeMakerWindow(QMainWindow):
         self.remesh_button.clicked.connect(self.open_remesh_dialog)
         self.shell_checkbox.toggled.connect(self._on_shell_toggle)
         self.infill_button.clicked.connect(self.run_generation)
+        self.material_combo.currentTextChanged.connect(self._on_material_change)
+        self.view_selector.currentIndexChanged.connect(self.update_view)
         self.view_selector.currentIndexChanged.connect(self.update_view)
         self.fea_result_selector.currentIndexChanged.connect(self.update_view)
         self.scalar_button.clicked.connect(self.load_scalar_field)
@@ -525,6 +616,7 @@ class LatticeMakerWindow(QMainWindow):
         self.get_bounds_button.clicked.connect(self._get_model_bounds_for_refinement)
         self.show_deformation_check.toggled.connect(self.update_view)
         self.deformation_scale_spin.valueChanged.connect(self.update_view)
+        self.animate_deformation_button.clicked.connect(self._run_deformation_animation)
         self.run_optimization_button.clicked.connect(self.run_optimization)
         self.suggest_resolution_button.clicked.connect(self._suggest_resolution)
         self.optim_iteration_selector.currentIndexChanged.connect(self.update_view)
@@ -538,6 +630,76 @@ class LatticeMakerWindow(QMainWindow):
         self.fixed_bc_radio.toggled.connect(self._on_bc_type_change)
         self.load_bc_radio.toggled.connect(self._on_bc_type_change)
         self.disp_bc_radio.toggled.connect(self._on_bc_type_change)
+        self.use_volume_fraction_check.toggled.connect(self._on_thickness_control_changed)
+        self.solidify_checkbox.toggled.connect(self._on_solidify_toggled)
+
+    def _run_deformation_animation(self):
+        """Animates the deformation of the current FEA result."""
+        mesh_to_animate = self._get_current_model_for_export()
+
+        if mesh_to_animate is None or 'Displacements' not in mesh_to_animate.point_data:
+            self.log("No FEA result with displacement data is available to animate.", "error")
+            QMessageBox.warning(self, "No Data Available", "Please run a simulation or load a result with displacement data first.")
+            return
+        
+        if np.linalg.norm(mesh_to_animate.point_data['Displacements']) < 1e-9:
+            self.log("Deformation is zero or negligible. Nothing to animate.", "warning")
+            return
+
+        self.set_busy(True)
+        self.animate_deformation_button.setEnabled(False)
+        self.log("Starting deformation animation...")
+
+        try:
+            self.plotter.clear()
+            self._update_selection_highlight(render=False) # Redraw selection points if any
+            
+            # Add a wireframe of the original shape for reference
+            self.plotter.add_mesh(mesh_to_animate, style='wireframe', color='grey', opacity=0.5)
+            
+            # Get the scalar field to display during animation
+            scalar_field = self.fea_result_selector.currentText()
+            scalar_bar_title = scalar_field.replace("_", " ").title()
+            pressure_unit = self.unit_manager.get_ui_label('pressure')
+            length_unit = self.unit_manager.get_ui_label('length')
+            if 'stress' in scalar_field:
+                scalar_bar_title += f" ({pressure_unit})"
+            elif 'displacement' in scalar_field:
+                scalar_bar_title += f" ({length_unit})"
+            
+            # Add the deforming mesh actor (initially at scale 0)
+            deforming_mesh = mesh_to_animate.copy()
+            self.main_mesh_actor = self.plotter.add_mesh(
+                deforming_mesh, 
+                scalars=scalar_field, 
+                cmap="turbo",
+                scalar_bar_args={'title': scalar_bar_title}
+            )
+
+            final_scale_factor = self.deformation_scale_spin.value()
+
+            # Animation Loop
+            for step in np.arange(0, 1.01, 0.1):
+                current_scale = final_scale_factor * step
+                warped_points = mesh_to_animate.points + mesh_to_animate.point_data['Displacements'] * current_scale
+                
+                # Directly update the points of the actor's dataset
+                self.main_mesh_actor.mapper.dataset.points = warped_points
+                self.status_bar.showMessage(f"Animating... Scale Factor: {step:.1f}")
+                
+                # Use a QEventLoop to pause without freezing the GUI
+                loop = QEventLoop()
+                QTimer.singleShot(50, loop.quit) # 50 ms delay between frames
+                loop.exec_()
+        
+        except Exception as e:
+            self.log(f"An error occurred during animation: {e}", "error")
+            traceback.print_exc()
+        finally:
+            self.status_bar.showMessage("Animation finished.", 3000)
+            self.animate_deformation_button.setEnabled(True)
+            self.set_busy(False)
+            self.update_view() # Restore the normal view
 
     def _set_unit_system(self, action):
         old_system_name = self.unit_manager.system_name
@@ -572,27 +734,41 @@ class LatticeMakerWindow(QMainWindow):
         force_unit = self.unit_manager.get_ui_label('force')
         pressure_unit = self.unit_manager.get_ui_label('pressure')
 
-        for spin in [self.unit_x_spin, self.unit_y_spin, self.unit_z_spin,
-                     self.lattice_thickness_spin, self.shell_thickness_spin,
-                     self.detail_size_spin, self.volume_g_size_spin,
-                     self.optim_min_thickness_spin, self.optim_max_thickness_spin,
-                     self.dx_spin, self.dy_spin, self.dz_spin]:
+        # Loop through all registered widgets to apply suffixes
+        for spin in self._unit_widgets.get('length', []):
             spin.setSuffix(f" {len_unit}")
+        
+        for spin in self._unit_widgets.get('pressure', []):
+            spin.setSuffix(f" {pressure_unit}")
+
+        for spin in self._unit_widgets.get('force', []):
+            # Force widgets don't have suffixes, but we update the main label
+            pass
         
         if hasattr(self, 'force_label'):
             self.force_label.setText(f"Force ({force_unit}):")
         
+        # Manually set suffixes for widgets not in the main dictionary
         self.optim_disp_limit_spin.setSuffix(f" {len_unit}")
-        self.optim_stress_limit_spin.setSuffix(f" {pressure_unit}")
         
         self.update_view()
 
     def _update_mass_reduction_label(self, value):
         self.mass_reduction_label.setText(f"{value}%")
 
+    def _update_disp_node_data(self):
+        """Populates self.disp_node_data from UI controls and selected nodes."""
+        self.disp_node_data.clear()
+        if self.disp_node_indices:
+            disp_vector_ui = (self.dx_spin.value(), self.dy_spin.value(), self.dz_spin.value())
+            for node_id in self.disp_node_indices:
+                self.disp_node_data[node_id] = disp_vector_ui
+        
     def run_optimization(self):
         if not self.fea_result_model: QMessageBox.warning(self, "Prerequisite Missing", "You must run a standard FEA simulation first to provide an initial state for the optimization."); self.log("Optimization aborted: No initial FEA result found.", "error"); return
         if not self.original_pv_shell: QMessageBox.warning(self, "Prerequisite Missing", "The original CAD shell is required for the optimization loop. Please re-import your model."); self.log("Optimization aborted: Original CAD shell not in memory.", "error"); return
+        
+        self._update_disp_node_data() # BUG FIX: Ensure disp_node_data is current
         self.set_busy(True)
         try:
             self.optimization_results = {}
@@ -600,7 +776,15 @@ class LatticeMakerWindow(QMainWindow):
             lattice_params = {'resolution': self.resolution_spin.value(), 'wx': self.unit_x_spin.value(), 'wy': self.unit_y_spin.value(), 'wz': self.unit_z_spin.value(),'lattice_type': self.lattice_type_box.currentText(), 'thickness': self.lattice_thickness_spin.value(),'solidify': self.solidify_checkbox.isChecked(), 'create_shell': self.shell_checkbox.isChecked(), 'shell_thickness': self.shell_thickness_spin.value()}
             meshing_params = {'detail_size': self.detail_size_spin.value(),'feature_angle': self.feature_angle_spin.value(),'volume_g_size': self.volume_g_size_spin.value(),'mesh_order': self.mesh_order_spin.value(),'optimize_ho': self.ho_optimize_check.isChecked(),'algorithm': self.mesh_algo_combo.currentText(),'skip_preprocessing': self.skip_preprocessing_check.isChecked(), 'lattice_model': True}
             
-            fea_params = {"material": MATERIALS[self.material_combo.currentText()],
+            if self.material_combo.currentText() == "Custom":
+                material_properties = {
+                    "ex": self.unit_manager.convert_to_solver(self.ex_spin.value(), 'pressure'), 
+                    "prxy": self.prxy_spin.value()
+                }
+            else:
+                material_properties = MATERIALS[self.material_combo.currentText()]
+
+            fea_params = {"material": material_properties,
                           "fixed_node_indices": list(self.fixed_node_indices),
                           "loaded_node_indices": list(self.load_node_indices),
                           "force": (self.fx_spin.value(), self.fy_spin.value(), self.fz_spin.value()),
@@ -608,12 +792,14 @@ class LatticeMakerWindow(QMainWindow):
                           "log_func": self.log,
                           "progress_callback": self.update_progress_bar}
             
+            scalar_source = 'strain_energy' if self.optim_scalar_energy_radio.isChecked() else 'von_mises_stress'
             optim_params = {
                 'max_iterations': self.optim_max_iter_spin.value(),
                 'objective': self.optim_objective_combo.currentText(),
                 'mass_reduction_ratio': self.mass_reduction_slider.value() / 100.0,
                 'stress_limit': self.optim_stress_limit_spin.value(),
                 'disp_limit': self.optim_disp_limit_spin.value(),
+                'scalar_field_source': scalar_source,
                 'min_thickness': self.optim_min_thickness_spin.value(),
                 'max_thickness': self.optim_max_thickness_spin.value()
             }
@@ -677,6 +863,7 @@ class LatticeMakerWindow(QMainWindow):
         temp_dir = tempfile.mkdtemp()
         
         try:
+            self._update_disp_node_data() # Ensure latest displacement data is saved
             original_model_filename = os.path.basename(self.original_model_path)
             disp_data_to_save = {str(k): v for k, v in self.disp_node_data.items()}
             project_data = {
@@ -698,7 +885,9 @@ class LatticeMakerWindow(QMainWindow):
                     "material": self.material_combo.currentText(), "force_x": self.fx_spin.value(), "force_y": self.fy_spin.value(),
                     "force_z": self.fz_spin.value(), "fixed_node_indices": list(self.fixed_node_indices), 
                     "load_node_indices": list(self.load_node_indices),
-                    "disp_node_data": disp_data_to_save
+                    "disp_node_data": disp_data_to_save,
+                    "custom_ex": self.ex_spin.value(),
+                    "custom_prxy": self.prxy_spin.value()
                 },
                 "meshing_params": { "element_type": "Tetrahedral" if self.tet_radio.isChecked() else "Hexahedral", "detail_size": self.detail_size_spin.value(),
                     "volume_g_size": self.volume_g_size_spin.value(), "feature_angle": self.feature_angle_spin.value(),
@@ -710,6 +899,7 @@ class LatticeMakerWindow(QMainWindow):
                     "mass_reduction_ratio": self.mass_reduction_slider.value(),
                     "stress_limit": self.optim_stress_limit_spin.value(),
                     "disp_limit": self.optim_disp_limit_spin.value(),
+                    "scalar_field_source": "strain_energy" if self.optim_scalar_energy_radio.isChecked() else "von_mises_stress",
                     "min_thickness": self.optim_min_thickness_spin.value(),
                     "max_thickness": self.optim_max_thickness_spin.value()
                 }
@@ -782,13 +972,38 @@ class LatticeMakerWindow(QMainWindow):
 
             lp = project_data.get("lattice_params", {}); self.lattice_type_box.setCurrentText(lp.get("type", "gyroid")); self.resolution_spin.setValue(lp.get("resolution", 1.0)); self.unit_x_spin.setValue(lp.get("cell_x", 10.0)); self.unit_y_spin.setValue(lp.get("cell_y", 10.0)); self.unit_z_spin.setValue(lp.get("cell_z", 10.0)); self.solidify_checkbox.setChecked(lp.get("solidify", False)); self.lattice_thickness_spin.setValue(lp.get("thickness", 1.0)); self.shell_checkbox.setChecked(lp.get("create_shell", False)); self.shell_thickness_spin.setValue(lp.get("shell_thickness", 1.0))
             fp = project_data.get("fea_params", {}); self.material_combo.setCurrentText(fp.get("material", "Titanium (Ti-6Al-4V)")); self.fx_spin.setValue(fp.get("force_x", 0.0)); self.fy_spin.setValue(fp.get("force_y", 0.0)); self.fz_spin.setValue(fp.get("force_z", -1000.0)); self.fixed_node_indices = set(fp.get("fixed_node_indices", [])); self.load_node_indices = set(fp.get("load_node_indices", []))
+            default_ex = self.unit_manager.convert_from_solver(MATERIALS["Titanium (Ti-6Al-4V)"]["ex"], 'pressure')
+            default_prxy = MATERIALS["Titanium (Ti-6Al-4V)"]["prxy"]
+            
+            self.ex_spin.setValue(fp.get("custom_ex", default_ex))
+            self.prxy_spin.setValue(fp.get("custom_prxy", default_prxy))
             disp_data_loaded = fp.get("disp_node_data", {})
             self.disp_node_data = {float(k): tuple(v) for k, v in disp_data_loaded.items()}
+            self.disp_node_indices = set(self.disp_node_data.keys()) # Restore indices from loaded data
+            if self.disp_node_data:
+                try:
+                    # All nodes share the same displacement vector from the UI
+                    # Get the vector from the first node in the loaded data
+                    first_key = list(self.disp_node_data.keys())[0]
+                    dx, dy, dz = self.disp_node_data[first_key]
+                    
+                    # Update the UI spins to reflect the loaded data
+                    self.dx_spin.setValue(dx)
+                    self.dy_spin.setValue(dy)
+                    self.dz_spin.setValue(dz)
+                except Exception as e:
+                    self.log(f"Warning: Could not restore displacement BC UI values: {e}", "warning")
             mp = project_data.get("meshing_params", {}); self.hex_radio.setChecked(True) if mp.get("element_type") == "Hexahedral" else self.tet_radio.setChecked(True); self.detail_size_spin.setValue(mp.get("detail_size", 1.0)); self.volume_g_size_spin.setValue(mp.get("volume_g_size", 0.0)); self.feature_angle_spin.setValue(mp.get("feature_angle", 30.0)); self.mesh_algo_combo.setCurrentText(mp.get("algorithm", "HXT")); self.mesh_order_spin.setValue(mp.get("mesh_order", 1))
             op = project_data.get("optim_params", {}); self.optim_max_iter_spin.setValue(op.get("max_iterations", 5)); self.optim_objective_combo.setCurrentText(op.get("objective", "Minimize Max Stress")); self.optim_stress_limit_spin.setValue(op.get("stress_limit", 1e12)); self.optim_disp_limit_spin.setValue(op.get("disp_limit", 1000.0)); self.optim_min_thickness_spin.setValue(op.get("min_thickness", 0.2)); self.optim_max_thickness_spin.setValue(op.get("max_thickness", 2.0))
             
             priority_value = op.get("mass_reduction_priority", int(op.get("weight_penalty_factor", 0.5) * 100))
             self.mass_reduction_slider.setValue(priority_value)
+
+            scalar_source_loaded = op.get("scalar_field_source", "von_mises_stress")
+            if scalar_source_loaded == "strain_energy":
+                self.optim_scalar_energy_radio.setChecked(True)
+            else:
+                self.optim_scalar_stress_radio.setChecked(True)
 
             if project_data.get("has_volumetric_mesh"): self.volumetric_mesh = pv.read(os.path.join(temp_dir, 'volumetric_mesh.vtk'))
             if project_data.get("has_fea_result"):
@@ -802,18 +1017,39 @@ class LatticeMakerWindow(QMainWindow):
                 self.optimization_results = {}
                 opt_dir = os.path.join(temp_dir, 'opt_results')
                 if os.path.isdir(opt_dir):
-                    i = 0
-                    while True:
-                        stl_path = os.path.join(opt_dir, f'iter_{i}_lattice.stl')
-                        fea_path = os.path.join(opt_dir, f'iter_{i}_fea.vtk')
-                        if os.path.exists(stl_path) and os.path.exists(fea_path):
-                            self.optimization_results[i] = {
-                                'surface_mesh': pv.read(stl_path),
-                                'fea_result': pv.read(fea_path)
-                            }
-                            i += 1
-                        else:
-                            break
+                    stl_pattern = re.compile(r'iter_(\d+)_lattice\.stl')
+                    all_files = os.listdir(opt_dir)
+                    found_iterations = 0                    
+                    for stl_filename in all_files:
+                        match = stl_pattern.match(stl_filename)
+                        if match:
+                            # Found an STL file, get its iteration number
+                            iter_num_str = match.group(1)
+                            i = int(iter_num_str)
+                            
+                            # Check if the corresponding FEA file also exists
+                            fea_filename = f'iter_{i}_fea.vtk'
+                            fea_path = os.path.join(opt_dir, fea_filename)
+                            
+                            if fea_filename in all_files:
+                                # Both files exist, load them
+                                try:
+                                    stl_path = os.path.join(opt_dir, stl_filename)
+                                    self.optimization_results[i] = {
+                                        'surface_mesh': pv.read(stl_path),
+                                        'fea_result': pv.read(fea_path)
+                                    }
+                                    found_iterations += 1
+                                except Exception as e:
+                                    self.log(f"Warning: Could not load optimization result for iteration {i}. Error: {e}", "warning")
+                            else:
+                                self.log(f"Warning: Found {stl_filename} but missing {fea_filename}. Skipping iteration {i}.", "warning")
+                    
+                    if found_iterations > 0:
+                        self.log(f"Successfully loaded {found_iterations} optimization iterations.")
+                        self._populate_iteration_selector()
+                    else:
+                        self.log("Found optimization results directory, but no valid iteration pairs were loaded.", "warning")
                     self._populate_iteration_selector()
 
             self.log("Project successfully loaded.", "success")
@@ -881,6 +1117,28 @@ class LatticeMakerWindow(QMainWindow):
         self.detail_size_label.setVisible(True); self.detail_size_spin.setVisible(True)
         self._adapt_toolbox_width()
 
+    def _on_thickness_control_changed(self):
+        use_vf = self.use_volume_fraction_check.isChecked()
+        self.lattice_thickness_label.setVisible(not use_vf)
+        self.lattice_thickness_spin.setVisible(not use_vf)
+        self.volume_fraction_label.setVisible(use_vf)
+        self.volume_fraction_spin.setVisible(use_vf)
+        self._adapt_toolbox_width()
+
+    def _on_solidify_toggled(self, checked):
+        """Shows or hides all thickness-related controls."""
+        self.lattice_thickness_label.setVisible(checked)
+        self.lattice_thickness_spin.setVisible(checked)
+        self.use_volume_fraction_check.setVisible(checked)
+        
+        if checked:
+            self._on_thickness_control_changed()
+        else:
+            self.volume_fraction_label.setVisible(False)
+            self.volume_fraction_spin.setVisible(False)
+
+        self._adapt_toolbox_width()
+
     def _on_shell_toggle(self, checked):
         self.shell_thickness_label.setVisible(checked); self.shell_thickness_spin.setVisible(checked)
         if checked:
@@ -888,7 +1146,13 @@ class LatticeMakerWindow(QMainWindow):
         else:
             self.solidify_checkbox.setEnabled(True)
         self._adapt_toolbox_width()
-            
+
+    def _on_material_change(self, text):
+        """Shows or hides the custom material input fields."""
+        is_custom = (text == "Custom")
+        self.custom_material_group.setVisible(is_custom)
+        self._adapt_toolbox_width()        
+        
     def _on_bc_type_change(self):
         is_load = self.load_bc_radio.isChecked()
         is_disp = self.disp_bc_radio.isChecked()
@@ -952,6 +1216,7 @@ class LatticeMakerWindow(QMainWindow):
                 'lattice_type': self.lattice_type_box.currentText(), 'thickness': self.lattice_thickness_spin.value(),
                 'log_func': self.log, **self.remesh_settings, 'solidify': self.solidify_checkbox.isChecked(),
                 'create_shell': self.shell_checkbox.isChecked(), 'shell_thickness': self.shell_thickness_spin.value(),
+                'use_volume_fraction': self.use_volume_fraction_check.isChecked(), 'target_volume_fraction': self.volume_fraction_spin.value(),
                 'external_scalar': self.external_scalar,
                 'use_scalar_for_cell_size': self.use_scalar_for_cell_size_checkbox.isChecked() and self.external_scalar is not None,
                 'use_scalar_for_thickness': self.solidify_checkbox.isChecked() and self.use_scalar_checkbox.isChecked() and self.external_scalar is not None
@@ -1020,6 +1285,7 @@ class LatticeMakerWindow(QMainWindow):
             self.main_mesh_actor.SetVisibility(False)
             self.selection_surface = self.volumetric_mesh.extract_surface(pass_pointid=True)
             self.selection_actor = self.plotter.add_mesh(self.selection_surface, style='surface', color='orange', show_edges=True)
+            # self.plotter.enable_lasso_selection(callback=self._handle_cell_selection, show_message=False)
             self.plotter.enable_cell_picking(callback=self._handle_cell_selection, show_message=False)
             self.log("Selection mode is ON. Please select faces on the model.")
         else:
@@ -1111,11 +1377,15 @@ class LatticeMakerWindow(QMainWindow):
         self.fixed_node_indices.clear()
         self.load_node_indices.clear()
         self.disp_node_indices.clear()
+        self.disp_node_data.clear()
         self._update_selection_highlight()
         self.log("FEA selections cleared.")
 
     def run_simulation(self):
         if not self.volumetric_mesh: self.log("Create a volumetric mesh first.", "error"); return
+        
+        self._update_disp_node_data() # BUG FIX: Ensure disp_node_data is current
+
         if not (self.fixed_node_indices or self.load_node_indices or self.disp_node_indices):
              self.log("Select at least one boundary condition (Fixed, Load, or Displacement) first.", "error")
              return
@@ -1132,16 +1402,23 @@ class LatticeMakerWindow(QMainWindow):
                 self.unit_manager.convert_to_solver(self.fy_spin.value(), 'force'),
                 self.unit_manager.convert_to_solver(self.fz_spin.value(), 'force')
             )
-
+            
+            # Convert the UI values in self.disp_node_data to solver units
             disp_data_solver = {}
-            if self.disp_node_indices:
-                disp_vector_ui = (self.dx_spin.value(), self.dy_spin.value(), self.dz_spin.value())
-                disp_vector_solver = self.unit_manager.convert_to_solver(np.array(disp_vector_ui), 'length')
-                for node_id in self.disp_node_indices:
-                    disp_data_solver[node_id] = disp_vector_solver
+            if self.disp_node_data:
+                for pid, disp_vector_ui in self.disp_node_data.items():
+                    disp_vector_solver = self.unit_manager.convert_to_solver(np.array(disp_vector_ui), 'length')
+                    disp_data_solver[pid] = disp_vector_solver
+
+            # CORRECTLY GATHER MATERIAL PROPERTIES
+            material_properties = {
+                "ex": self.unit_manager.convert_to_solver(self.ex_spin.value(), 'pressure'), 
+                "prxy": self.prxy_spin.value()
+            } if self.material_combo.currentText() == "Custom" else MATERIALS[self.material_combo.currentText()]
 
             params = {
-                "mesh": solver_mesh, "material": MATERIALS[self.material_combo.currentText()],  
+                "mesh": solver_mesh, 
+                "material": material_properties,
                 "fixed_node_indices": list(self.fixed_node_indices),  
                 "loaded_node_indices": list(self.load_node_indices),  
                 "disp_node_data": disp_data_solver,
@@ -1152,15 +1429,27 @@ class LatticeMakerWindow(QMainWindow):
             
             if self.fea_result_model:
                 self.fea_result_model_solver = self.fea_result_model.copy()
-                disp_solver = self.fea_result_model.point_data['Displacements']
-                self.fea_result_model.points = self.unit_manager.convert_from_solver(self.fea_result_model.points, 'length')
-                self.fea_result_model.point_data['Displacements'] = self.unit_manager.convert_from_solver(disp_solver, 'length')
-                self.fea_result_model.point_data['displacement'] = np.linalg.norm(self.fea_result_model.point_data['Displacements'], axis=1)
                 
-                for field in ["von_mises_stress"]:
-                    if field in self.fea_result_model.point_data:
-                        stress_solver = self.fea_result_model.point_data[field]
-                        self.fea_result_model.point_data[field] = self.unit_manager.convert_from_solver(stress_solver, 'pressure')
+                # Convert points and point_data to UI units
+                self.fea_result_model.points = self.unit_manager.convert_from_solver(self.fea_result_model.points, 'length')
+                
+                if 'Displacements' in self.fea_result_model.point_data:
+                    disp_solver = self.fea_result_model.point_data['Displacements']
+                    self.fea_result_model.point_data['Displacements'] = self.unit_manager.convert_from_solver(disp_solver, 'length')
+                    self.fea_result_model.point_data['displacement'] = np.linalg.norm(self.fea_result_model.point_data['Displacements'], axis=1)
+                
+                if "von_mises_stress" in self.fea_result_model.point_data:
+                    stress_solver = self.fea_result_model.point_data["von_mises_stress"]
+                    self.fea_result_model.point_data["von_mises_stress"] = self.unit_manager.convert_from_solver(stress_solver, 'pressure')
+
+                # Convert all relevant cell_data to UI units
+                if "von_mises_stress" in self.fea_result_model.cell_data:
+                    stress_solver_cell = self.fea_result_model.cell_data["von_mises_stress"]
+                    self.fea_result_model.cell_data["von_mises_stress"] = self.unit_manager.convert_from_solver(stress_solver_cell, 'pressure')
+                
+                if "strain_energy" in self.fea_result_model.cell_data:
+                    energy_solver_cell = self.fea_result_model.cell_data["strain_energy"]
+                    self.fea_result_model.cell_data["strain_energy"] = self.unit_manager.convert_from_solver(energy_solver_cell, 'energy')
             
             self.log("FEA simulation completed.", "success")
             self.optim_group.setEnabled(True)
@@ -1225,6 +1514,7 @@ class LatticeMakerWindow(QMainWindow):
         show_fea_controls = is_fea_view or (is_optim_view and has_optim_results and self.show_optim_fea_check.isChecked())
         
         self.fea_result_selector.setVisible(show_fea_controls)
+        self.animate_deformation_button.setVisible(show_fea_controls)
         is_warped_view_active = show_fea_controls and self.show_deformation_check.isChecked()
         self.deformation_scale_label.setVisible(is_warped_view_active)
         self.deformation_scale_spin.setVisible(is_warped_view_active)
@@ -1243,21 +1533,44 @@ class LatticeMakerWindow(QMainWindow):
             self.plotter.reset_camera()
             return
         
-        scalar_bar_title = self.fea_result_selector.currentText().replace("_", " ").title()
+        selected_scalar = self.fea_result_selector.currentText()
+        scalar_bar_title = selected_scalar.replace("_", " ").title()
         if show_fea_controls:
             pressure_unit = self.unit_manager.get_ui_label('pressure')
             length_unit = self.unit_manager.get_ui_label('length')
-            if 'stress' in self.fea_result_selector.currentText():
+            energy_unit = self.unit_manager.get_ui_label('energy')
+            if 'stress' in selected_scalar:
                 scalar_bar_title += f" ({pressure_unit})"
-            elif 'displacement' in self.fea_result_selector.currentText():
+            elif 'displacement' in selected_scalar:
                 scalar_bar_title += f" ({length_unit})"
+            elif 'energy' in selected_scalar:
+                scalar_bar_title += f" ({energy_unit})"
         
         mesh_kwargs = {'cmap': "turbo", 'scalar_bar_args': {'title': scalar_bar_title}}
+
+        if show_fea_controls:
+            # Use smooth shading for high-quality FEA contours
+            # mesh_kwargs['smooth_shading'] = True
+            mesh_kwargs['scalars'] = selected_scalar
+
+            mesh_kwargs['show_edges'] = True
+            mesh_kwargs['edge_color'] = 'black'
+            mesh_kwargs['line_width'] = 1  # Optional: control edge thickness
+            
+            # Set scalar preference (cell vs. point)
+            if selected_scalar == 'strain_energy':
+                mesh_kwargs['preference'] = 'cell'
+            else:
+                mesh_kwargs['preference'] = 'point'
+        else:
+            # Default rendering for non-FEA meshes (CAD, Result)
+            mesh_kwargs['color'] = 'orange'
+            mesh_kwargs['show_edges'] = True
 
         if is_warped_view_active and 'Displacements' in mesh_to_display.point_data:
             if np.linalg.norm(mesh_to_display.point_data['Displacements']) > 1e-9:
                 scale_factor = self.deformation_scale_spin.value()
-                mesh_kwargs['scalars'] = self.fea_result_selector.currentText()
+                # 'scalars' and 'preference' are now already in mesh_kwargs
             
                 self.plotter.add_mesh(mesh_to_display, style='wireframe', color='grey', opacity=0.5)
                 warped_mesh = mesh_to_display.warp_by_vector('Displacements', factor=scale_factor)
@@ -1267,16 +1580,13 @@ class LatticeMakerWindow(QMainWindow):
                 is_warped_view_active = False 
         
         if not is_warped_view_active:
-            if show_fea_controls:
-                mesh_kwargs['scalars'] = self.fea_result_selector.currentText()
-            else:
-                mesh_kwargs = {'color': 'orange', 'show_edges': True}
-
+            # --- This block is now much simpler ---
+            # All the logic for scalars/color/edges is already in mesh_kwargs
+            
             if self.clipping_settings.get("enabled", False):  
                 self.main_mesh_actor = self.plotter.add_mesh_clip_plane(mesh_to_display, invert=self.clipping_settings.get("invert", False), **mesh_kwargs)
             else:  
                 self.main_mesh_actor = self.plotter.add_mesh(mesh_to_display, **mesh_kwargs)
-
         if view_text == "CAD" and self.show_voxel_preview_check.isChecked():
             try:
                 density = [(b - a) / self.detail_size_spin.value() for a, b in zip(mesh_to_display.bounds[::2], mesh_to_display.bounds[1::2])]
